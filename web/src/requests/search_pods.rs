@@ -476,7 +476,11 @@ pub async fn call_get_podcast_episodes(
             if episode.guid.is_empty() {
                 episode.guid = episode.episodeid.to_string();
             }
-            episode.is_youtube = false;
+            // Trust the backend's per-row is_youtube flag. This endpoint unions the
+            // Episodes and YouTubeVideos tables and tags each row correctly, so a YouTube
+            // channel video keeps is_youtube=true and the click-through carries `&youtube=true`
+            // to the episode page. Hardcoding false here dropped that distinction and made
+            // YouTube episode lookups hit the wrong table.
             episode
         })
         .collect::<Vec<_>>();

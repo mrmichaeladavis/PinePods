@@ -6187,150 +6187,318 @@ input:checked + .notification-toggle-slider:before {
   }
 }
 
-/* Notification bell styling */
-.notification-bell {
-    color: var(--text-color);
-    background-color: var(--container-button-color);
-    transition: background-color 0.2s ease;
+/* ============================================================
+   Activity center — Direction 2 "Status cards", drawer + compact.
+   Ported from the PinePods Design System (ui_kits/web/notifications.css).
+   Everything resolves to theme CSS vars so it re-skins per theme.
+   ============================================================ */
+.notification-center { position: relative; display: inline-flex; }
+
+/* ---------- Bell ---------- */
+.nc-bell {
+  position: relative; width: 40px; height: 40px; border: none; cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: transparent; border-radius: 8px; color: var(--text-color);
+  transition: background-color 140ms ease;
+}
+.nc-bell:hover { background: color-mix(in srgb, var(--text-color) 8%, transparent); }
+.nc-bell.is-open { background: color-mix(in srgb, var(--text-color) 12%, transparent); }
+.nc-bell i { font-size: 23px; }
+.nc-bell-badge {
+  position: absolute; top: 3px; right: 3px; min-width: 17px; height: 17px; padding: 0 4px;
+  border-radius: var(--radius-full); background: var(--alert-color); color: var(--button-text-color);
+  font-size: 10.5px; font-weight: 700; line-height: 17px; text-align: center;
+  box-shadow: 0 0 0 2px var(--secondary-background);
+  animation: nc-badge-pop 260ms var(--ease-spring, ease-out);
+}
+@keyframes nc-badge-pop { 0% { transform: scale(0); } 60% { transform: scale(1.25); } 100% { transform: scale(1); } }
+
+/* ---------- Panel shell + drawer form ---------- */
+.nc-panel {
+  position: fixed; z-index: 1301; display: flex; flex-direction: column;
+  background: var(--container-background); color: var(--text-color);
+  /* Route the panel's local tokens straight onto the app theme system so the
+     Activity center re-skins with every theme (no bespoke colors). */
+  --nc-line: var(--border-color);
+  --nc-soft: var(--unfilled-color);
+  --nc-softer: var(--secondary-background);
+  --nc-accent: var(--accent-color);
+}
+.nc-scrim {
+  /* Same dimming overlay convention as .queue-scrim (no themed overlay token). */
+  position: fixed; inset: 0; z-index: 1300; background: rgba(0,0,0,.45);
+  opacity: 0; pointer-events: none; transition: opacity 220ms ease-out;
+}
+.nc-scrim.is-open { opacity: 1; pointer-events: auto; }
+.nc-panel.nc-form-drawer {
+  top: 0; right: 0; bottom: 0; width: 392px; max-height: none;
+  border-left: 1px solid var(--nc-line);
+  box-shadow: var(--shadow-xl);
+  transform: translateX(100%);
+  transition: transform 300ms var(--ease-out, cubic-bezier(.16,1,.3,1));
+}
+.nc-panel.nc-form-drawer.is-open { transform: translateX(0); }
+
+/* ---------- Header ---------- */
+.nc-header { display: flex; align-items: center; gap: 10px; padding: 16px 16px 12px; }
+.nc-h-title { font-size: 16px; font-weight: 700; letter-spacing: -.01em; margin: 0; }
+.nc-h-spacer { flex: 1; }
+.nc-h-btn {
+  width: 30px; height: 30px; border: none; background: transparent; cursor: pointer;
+  border-radius: 7px; color: var(--text-color); opacity: .7;
+  display: inline-flex; align-items: center; justify-content: center;
+  transition: background-color 130ms ease, opacity 130ms ease;
+}
+.nc-h-btn i { font-size: 17px; }
+.nc-h-btn:hover { background: var(--nc-soft); opacity: 1; }
+
+/* ---------- Tabs (segmented for dir-2) ---------- */
+.nc-tabs { display: flex; gap: 2px; padding: 0 14px 6px; position: relative; }
+.nc-tab {
+  border: none; background: transparent; cursor: pointer; position: relative;
+  color: var(--text-secondary-color); font-family: inherit; font-size: 13px; font-weight: 600;
+  padding: 7px 12px 10px; opacity: .7; transition: color 130ms ease, opacity 130ms ease;
+  display: inline-flex; align-items: center; gap: 6px;
+}
+.nc-tab:hover { opacity: 1; }
+.nc-tab.is-active { color: var(--text-color); opacity: 1; }
+.nc-tab-pip {
+  font-size: 10.5px; font-weight: 700; line-height: 1; padding: 2px 5px; border-radius: var(--radius-full);
+  background: var(--nc-soft); color: var(--text-color);
+}
+.nc-dir-2 .nc-tabs { gap: 0; margin: 0 14px 8px; padding: 3px; background: var(--nc-softer); border-radius: 10px; }
+.nc-dir-2 .nc-tab { flex: 1; justify-content: center; padding: 7px 4px; border-radius: 7px; }
+.nc-dir-2 .nc-tab.is-active { background: var(--nc-soft); }
+
+/* ---------- Summary strip ---------- */
+.nc-summary {
+  margin: 2px 14px 10px; padding: 10px 12px; border-radius: 10px;
+  background: color-mix(in srgb, var(--nc-accent) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--nc-accent) 26%, transparent);
+}
+.nc-summary-top { display: flex; align-items: center; gap: 8px; font-size: 12.5px; font-weight: 600; margin-bottom: 8px; }
+.nc-summary-top i { font-size: 15px; color: var(--nc-accent); }
+.nc-summary-pct { margin-left: auto; font-family: var(--font-mono, monospace); font-size: 12px; opacity: .8; }
+.nc-spinner { animation: nc-spin 1.1s linear infinite; display: inline-flex; }
+@keyframes nc-spin { to { transform: rotate(360deg); } }
+
+/* ---------- Body / scroll ---------- */
+.nc-body { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 2px 12px 14px; }
+.nc-body::-webkit-scrollbar { width: 8px; }
+.nc-body::-webkit-scrollbar-thumb { background: var(--nc-line); border-radius: 8px; }
+.nc-section-label {
+  font-size: 11px; font-weight: 700; letter-spacing: .07em; text-transform: uppercase;
+  color: var(--text-secondary-color); opacity: .65; padding: 12px 8px 6px;
+  display: flex; align-items: center; gap: 8px;
+}
+.nc-section-label .n { opacity: .8; font-weight: 600; }
+.nc-section-clear {
+  margin-left: auto; border: none; background: transparent; cursor: pointer; opacity: .8;
+  color: var(--nc-accent); font-family: inherit; font-size: 11px; font-weight: 600; letter-spacing: 0;
+  text-transform: none; padding: 2px 4px;
+}
+.nc-section-clear:hover { text-decoration: underline; }
+
+/* ---------- Item enter animation ---------- */
+@keyframes nc-item-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+.nc-card { animation: nc-item-in 260ms var(--ease-out, ease) both; }
+@media (prefers-reduced-motion: reduce) {
+  .nc-card, .nc-panel, .nc-scrim, .nc-bell-badge { animation: none !important; }
 }
 
-/* Notification badge */
-.notification-badge {
-    background-color: var(--alert-color);
-    color: var(--text-color);
-    min-width: 18px;
-    height: 18px;
+/* ---------- Home "Continue Listening" swap animations ---------- */
+/* Margin-based spacing (not flex gap / space-y) so a leaving card's collapsing
+   height + margin smoothly pulls the cards below it upward.
+   IMPORTANT: the resting card must have NO overflow clip and NO lingering
+   transform, otherwise it clips / becomes the containing block for the card's
+   own fixed-position popouts (context menu, description modal). So `overflow`
+   and `transform` are confined to the transient animations only, and the enter
+   animation uses `backwards` fill (not `both`) so no transform remains at rest. */
+.continue-list > .continue-item { margin-bottom: 1rem; }
+.continue-list > .continue-item:last-child { margin-bottom: 0; }
+.continue-item { animation: continueItemIn 340ms cubic-bezier(.16, 1, .3, 1) backwards; }
+.continue-item.leaving {
+  overflow: hidden;
+  animation: continueItemOut 400ms cubic-bezier(.4, 0, .2, 1) forwards;
+  pointer-events: none;
+}
+@keyframes continueItemIn {
+  from { opacity: 0; transform: translateY(10px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes continueItemOut {
+  from { opacity: 1; transform: translateY(0);   max-height: 1000px; margin-bottom: 1rem; }
+  to   { opacity: 0; transform: translateY(-8px); max-height: 0;      margin-bottom: 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .continue-item, .continue-item.leaving { animation: none !important; }
 }
 
-/* Notification dropdown */
-.notification-dropdown {
-    background-color: var(--container-background);
-    border: 1px solid var(--border-color);
-    border-radius: 8px;
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
-    animation: slideDown 0.2s ease-out forwards;
+/* ---------- Shared item pieces ---------- */
+.nc-main-col { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.nc-line1 {
+  font-size: 13.5px; font-weight: 600; line-height: 1.3; color: var(--text-color);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-
-@keyframes slideDown {
-    from {
-        opacity: 0;
-        transform: translateY(-10px);
-    }
-    to {
-        opacity: 1;
-        transform: translateY(0);
-    }
+.nc-line2 {
+  font-size: 11.5px; color: var(--text-secondary-color); opacity: .82;
+  display: flex; align-items: center; gap: 6px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
 }
+.nc-dir-2 .nc-line2 { margin-top: 1px; }
+.nc-dot-sep { opacity: .5; }
+.nc-status-word.k-active  { color: var(--nc-accent); }
+.nc-status-word.k-success { color: var(--success-color); }
+.nc-status-word.k-failed  { color: var(--error-color); }
 
-/* Notification header */
-.notification-header {
-    background-color: var(--secondary-background);
-    color: var(--text-color);
-    border-bottom: 1px solid var(--border-color);
-    border-top-left-radius: 8px;
-    border-top-right-radius: 8px;
+.nc-prog { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
+.nc-prog-track { flex: 1; height: 5px; border-radius: var(--radius-full); background: var(--nc-soft); overflow: hidden; }
+.nc-prog-fill { height: 100%; border-radius: var(--radius-full); background: var(--prog-bar-color); transition: width 420ms cubic-bezier(.16,1,.3,1); }
+.nc-prog-pct { font-family: var(--font-mono, monospace); font-size: 10.5px; color: var(--text-secondary-color); min-width: 34px; text-align: right; }
+
+.nc-trail { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; padding-top: 2px; }
+.nc-time { font-size: 10.5px; color: var(--text-secondary-color); opacity: .6; white-space: nowrap; }
+.nc-x {
+  width: 24px; height: 24px; border: none; background: transparent; cursor: pointer;
+  border-radius: 6px; color: var(--text-secondary-color); opacity: .55;
+  display: inline-flex; align-items: center; justify-content: center; transition: opacity 120ms ease, background-color 120ms ease;
 }
+.nc-x i { font-size: 14px; }
+.nc-card:hover .nc-x { opacity: .75; }
+.nc-x:hover { background: var(--nc-soft); opacity: 1 !important; }
 
-/* Notification items */
-.notification-item {
-    background-color: var(--background-color);
-    border-left: 3px solid var(--accent-color);
-    margin-bottom: 8px;
-    transition: background-color 0.2s ease;
+.nc-group-row { cursor: pointer; }
+.nc-group-caret { transition: transform 200ms ease; font-size: 13px; opacity: .6; }
+.nc-group-row.is-open .nc-group-caret { transform: rotate(90deg); }
+.nc-count-chip {
+  font-family: var(--font-mono, monospace); font-size: 10.5px; font-weight: 600;
+  padding: 2px 7px; border-radius: var(--radius-full); background: var(--nc-soft); color: var(--text-secondary-color);
 }
+.nc-children { padding-left: 45px; }
+.nc-child { display: flex; align-items: center; gap: 9px; padding: 7px 8px; position: relative; }
+.nc-child-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--text-secondary-color); opacity: .4; flex-shrink: 0; }
+.nc-child-dot.k-active { background: var(--nc-accent); opacity: 1; }
+.nc-child-dot.k-success { background: var(--success-color); opacity: 1; }
+.nc-child-dot.k-failed { background: var(--error-color); opacity: 1; }
+.nc-child-t { font-size: 12px; color: var(--text-color); opacity: .82; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+.nc-child-p { font-family: var(--font-mono, monospace); font-size: 10px; color: var(--text-secondary-color); }
 
-.notification-item:hover {
-    background-color: var(--secondary-background);
+/* ---------- DIRECTION 2 — Status cards ---------- */
+.nc-dir-2 .nc-card {
+  position: relative; display: grid; grid-template-columns: 42px 1fr auto; gap: 12px; align-items: start;
+  padding: 12px 12px 12px 14px; margin-bottom: 8px; border-radius: 12px;
+  background: var(--nc-softer); border: 1px solid var(--nc-line); overflow: hidden;
 }
-
-/* Status styles */
-.notification-status {
-    font-weight: 500;
+.nc-dir-2 .nc-card::before {
+  content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
+  background: var(--text-secondary-color); opacity: .5;
 }
-
-.status-pending {
-    background-color: var(--accent-color);
-    color: var(--text-color);
+.nc-dir-2 .nc-card.k-active::before  { background: var(--nc-accent); opacity: 1; }
+.nc-dir-2 .nc-card.k-queued::before  { background: var(--text-secondary-color); opacity: .4; }
+.nc-dir-2 .nc-card.k-success::before { background: var(--success-color); opacity: 1; }
+.nc-dir-2 .nc-card.k-failed::before  { background: var(--error-color); opacity: 1; }
+.nc-dir-2 .nc-card.k-error::before   { background: var(--error-color); opacity: 1; }
+.nc-dir-2 .nc-card.k-info::before    { background: var(--link-color); opacity: 1; }
+.nc-thumb {
+  width: 42px; height: 42px; border-radius: 8px; flex-shrink: 0; overflow: hidden;
+  display: inline-flex; align-items: center; justify-content: center; font-size: 20px;
+  background: var(--nc-soft); color: var(--text-color);
 }
-
-.status-started {
-    background-color: var(--prog-bar-color);
-    color: var(--text-color);
+.nc-thumb img { width: 100%; height: 100%; object-fit: cover; }
+.nc-thumb.k-active  { color: var(--nc-accent); background: color-mix(in srgb, var(--nc-accent) 16%, transparent); }
+.nc-thumb.k-success { color: var(--success-color); background: color-mix(in srgb, var(--success-color) 16%, transparent); }
+.nc-thumb.k-failed  { color: var(--error-color); background: color-mix(in srgb, var(--error-color) 16%, transparent); }
+.nc-thumb.k-queued  { color: var(--text-secondary-color); }
+.nc-thumb.k-info    { color: var(--link-color); background: color-mix(in srgb, var(--link-color) 16%, transparent); }
+.nc-thumb.k-error   { color: var(--error-color); background: color-mix(in srgb, var(--error-color) 16%, transparent); }
+.nc-pill {
+  font-size: 10px; font-weight: 700; letter-spacing: .02em; padding: 2px 7px; border-radius: var(--radius-full);
+  text-transform: uppercase; background: var(--nc-soft); color: var(--text-secondary-color);
 }
+.nc-pill.k-active  { background: color-mix(in srgb, var(--nc-accent) 22%, transparent); color: var(--nc-accent); }
+.nc-pill.k-success { background: color-mix(in srgb, var(--success-color) 22%, transparent); color: var(--success-color); }
+.nc-pill.k-failed  { background: color-mix(in srgb, var(--error-color) 22%, transparent); color: var(--error-color); }
+.nc-pill.k-queued  { background: var(--nc-soft); color: var(--text-secondary-color); }
 
-.status-success {
-    background-color: var(--success-color);
-    color: var(--text-color);
+/* ---------- Empty state ---------- */
+.nc-empty {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  text-align: center; padding: 44px 24px 52px; gap: 10px;
 }
-
-.status-failed {
-    background-color: var(--error-color);
-    color: var(--text-color);
+.nc-empty-ico {
+  width: 52px; height: 52px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center;
+  background: var(--nc-soft); color: var(--text-secondary-color); font-size: 26px;
 }
+.nc-empty-t { font-size: 14px; font-weight: 600; }
+.nc-empty-s { font-size: 12.5px; color: var(--text-secondary-color); opacity: .8; max-width: 220px; line-height: 1.5; }
 
-/* Progress bar */
-.notification-progress-bar-container {
-    background-color: var(--secondary-background);
-    border-radius: 4px;
-    overflow: hidden;
+/* ---------- Footer ---------- */
+.nc-footer { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-top: 1px solid var(--nc-line); }
+.nc-foot-btn {
+  border: none; background: transparent; cursor: pointer; color: var(--text-secondary-color);
+  font-family: inherit; font-size: 12px; font-weight: 600; padding: 6px 8px; border-radius: 7px;
+  display: inline-flex; align-items: center; gap: 6px; transition: background-color 130ms ease, color 130ms ease;
 }
+.nc-foot-btn i { font-size: 15px; }
+.nc-foot-btn:hover { background: var(--nc-soft); color: var(--text-color); }
+.nc-foot-spacer { flex: 1; }
 
-.progress-bar-fill {
-    background-color: var(--prog-bar-color);
-    transition: width 0.3s ease;
-}
+/* ---------- Density: compact ---------- */
+.nc-panel[data-density="compact"].nc-form-drawer { width: 356px; }
+.nc-panel[data-density="compact"] .nc-header { padding: 12px 14px 8px; }
+.nc-panel[data-density="compact"] .nc-h-title { font-size: 15px; }
+.nc-panel[data-density="compact"] .nc-tabs { padding-bottom: 4px; }
+.nc-panel[data-density="compact"] .nc-tab { padding: 5px 10px 8px; font-size: 12.5px; }
+.nc-panel[data-density="compact"] .nc-summary { margin: 0 12px 8px; padding: 8px 10px; }
+.nc-panel[data-density="compact"] .nc-section-label { padding: 8px 8px 4px; }
+.nc-panel[data-density="compact"] .nc-line1 { font-size: 12.5px; }
+.nc-panel[data-density="compact"] .nc-prog { margin-top: 4px; }
+.nc-panel[data-density="compact"].nc-dir-2 .nc-card { padding: 9px 10px 9px 12px; margin-bottom: 6px; grid-template-columns: 36px 1fr auto; gap: 10px; }
+.nc-panel[data-density="compact"].nc-dir-2 .nc-thumb { width: 36px; height: 36px; font-size: 17px; }
+.nc-panel[data-density="compact"] .nc-children { padding-left: 39px; }
 
-.progress-text {
-    color: var(--text-color);
-    font-size: 0.75rem;
-}
-
-/* Message notifications */
-.notification-error {
-    border-left-color: var(--error-color);
-}
-
-.notification-error i {
-    color: var(--error-color);
-}
-
-.notification-info {
-    border-left-color: var(--success-color);
-}
-
-.notification-info i {
-    color: var(--success-color);
-}
-
-/* Empty state */
-.notification-empty {
-    color: var(--accent-color);
-    font-style: italic;
-}
-
-/* Scrollbar styling for notification dropdown */
-.notification-dropdown::-webkit-scrollbar {
-    width: 6px;
-}
-
-.notification-dropdown::-webkit-scrollbar-track {
-    background: var(--secondary-background);
-    border-radius: 8px;
-}
-
-.notification-dropdown::-webkit-scrollbar-thumb {
-    background-color: var(--accent-color);
-    border-radius: 8px;
-}
-
-/* Mobile responsiveness */
+/* ---------- Mobile ---------- */
 @media (max-width: 640px) {
-    .notification-dropdown {
-        width: 100%;
-        max-width: calc(100vw - 20px);
-        right: -5px;
-    }
+  .nc-panel.nc-form-drawer,
+  .nc-panel[data-density="compact"].nc-form-drawer { width: 100vw; }
 }
+
+/* ============================================================
+   Remote devices — reuses the Activity drawer shell (.nc-panel /
+   .nc-form-drawer / .nc-scrim / .nc-header / .nc-body), themed rows below.
+   ============================================================ */
+.remote-devices { position: relative; display: inline-flex; }
+
+.rd-row {
+  display: flex; flex-direction: column; gap: 3px;
+  padding: 12px 4px; border-bottom: 1px solid var(--border-color);
+}
+.rd-row:last-child { border-bottom: none; }
+.rd-row-top { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.rd-name {
+  display: inline-flex; align-items: center; gap: 8px;
+  font-size: 13.5px; font-weight: 600; color: var(--text-color);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.rd-name i { font-size: 16px; color: var(--text-secondary-color); }
+.rd-state { font-size: 11px; color: var(--text-secondary-color); white-space: nowrap; flex-shrink: 0; }
+.rd-state.is-playing { color: var(--success-color); }
+.rd-track {
+  font-size: 12.5px; color: var(--text-color); margin-top: 1px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.rd-progress { font-family: var(--font-mono, monospace); font-size: 11px; color: var(--text-secondary-color); }
+.rd-controls { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+.rd-controls .iconbtn { width: 34px; height: 34px; }
+.rd-controls .iconbtn i { font-size: 18px; }
+.rd-play-here {
+  display: inline-flex; align-items: center; gap: 2px;
+  border: none; cursor: pointer; font-family: inherit; font-size: 12px; font-weight: 600;
+  padding: 7px 12px; border-radius: var(--radius-full);
+  color: var(--accent-color); background: color-mix(in srgb, var(--accent-color) 16%, transparent);
+  transition: background-color 130ms ease;
+}
+.rd-play-here:hover { background: color-mix(in srgb, var(--accent-color) 26%, transparent); }
+.rd-play-here i { font-size: 15px; }
 
 @keyframes spinner-rotate {
     0% {

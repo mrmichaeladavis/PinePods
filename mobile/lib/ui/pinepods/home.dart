@@ -5,6 +5,10 @@ import 'package:flutter/material.dart';
 import 'package:pinepods_mobile/bloc/settings/settings_bloc.dart';
 import 'package:pinepods_mobile/bloc/podcast/audio_bloc.dart';
 import 'package:pinepods_mobile/bloc/podcast/podcast_bloc.dart';
+import 'package:pinepods_mobile/bloc/ui/pager_bloc.dart';
+import 'package:pinepods_mobile/services/network/connectivity_service.dart';
+import 'package:pinepods_mobile/services/podcast/podcast_service.dart';
+import 'package:pinepods_mobile/ui/utils/local_download_utils.dart';
 import 'package:pinepods_mobile/services/pinepods/pinepods_service.dart';
 import 'package:pinepods_mobile/services/pinepods/pinepods_audio_service.dart';
 import 'package:pinepods_mobile/services/audio/audio_player_service.dart';
@@ -64,6 +68,19 @@ class _PinepodsHomeState extends State<PinepodsHome> {
   void initState() {
     super.initState();
     _loadHomeContent();
+    // Recover automatically when the server becomes reachable again after an
+    // offline launch, so the user doesn't have to manually retry (#935).
+    ConnectivityService.instance.addListener(_onConnectivityChanged);
+  }
+
+  void _onConnectivityChanged() {
+    if (!mounted) return;
+    final recovered = !ConnectivityService.instance.isOffline &&
+        !_isLoading &&
+        (_errorMessage.isNotEmpty || _homeData == null);
+    if (recovered) {
+      _loadHomeContent();
+    }
   }
 
   @override
@@ -86,6 +103,7 @@ class _PinepodsHomeState extends State<PinepodsHome> {
   @override
   void dispose() {
     _nowPlayingSub?.cancel();
+    ConnectivityService.instance.removeListener(_onConnectivityChanged);
     super.dispose();
   }
 
@@ -628,6 +646,155 @@ class _PinepodsHomeState extends State<PinepodsHome> {
     }
   }
 
+  /// Switch the bottom-nav selection to the Downloads tab (the full offline
+  /// library). No-op if the user has removed Downloads from their tab bar.
+  void _goToDownloads() {
+    final pager = Provider.of<PagerBloc>(context, listen: false);
+    final order = Provider.of<SettingsBloc>(context, listen: false)
+        .currentSettings
+        .bottomBarOrder;
+    final idx = order.indexOf('Downloads');
+    if (idx >= 0) {
+      pager.changePage(idx);
+    }
+  }
+
+  Future<void> _playLocalDownload(Episode episode) async {
+    final audioService = GlobalServices.pinepodsAudioService;
+    if (audioService == null) {
+      _showSnackBar('Audio service not available', Colors.red);
+      return;
+    }
+    try {
+      final pe = LocalDownloadUtils.toPinepodsEpisode(episode);
+      await playPinepodsEpisodeWithOptionalFullScreen(
+        context,
+        audioService,
+        pe,
+        resume: true,
+      );
+    } catch (e) {
+      _showSnackBar('Failed to play episode: $e', Colors.red);
+    }
+  }
+
+  /// Offline landing shown on the Home tab when the PinePods server is
+  /// unreachable (#935). Rather than a dead error page, surface the on-device
+  /// Downloads library so already-downloaded episodes stay browsable/playable,
+  /// and offer a jump to the full Downloads tab.
+  Widget _buildOfflineHome() {
+    final theme = Theme.of(context);
+    return Padding(
+      padding: const EdgeInsets.all(16.0),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Container(
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              color: Colors.orange.withOpacity(0.12),
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: Colors.orange.withOpacity(0.4)),
+            ),
+            child: Row(
+              children: [
+                Icon(Icons.cloud_off, color: Colors.orange[800]),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Offline mode',
+                        style: TextStyle(
+                          fontWeight: FontWeight.bold,
+                          color: Colors.orange[800],
+                          fontSize: 16,
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      const Text(
+                        'Your PinePods server is unreachable. You can still '
+                        'browse and play episodes downloaded to this device.',
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 16),
+          FutureBuilder<List<Episode>>(
+            future: Provider.of<PodcastService>(context, listen: false)
+                .loadDownloads(),
+            builder: (context, snapshot) {
+              if (snapshot.connectionState == ConnectionState.waiting) {
+                return const Padding(
+                  padding: EdgeInsets.all(24.0),
+                  child: Center(child: CircularProgressIndicator()),
+                );
+              }
+              final downloads =
+                  (snapshot.data ?? []).where((e) => e.downloaded).toList();
+              if (downloads.isEmpty) {
+                return const Padding(
+                  padding: EdgeInsets.symmetric(vertical: 16.0),
+                  child: Text('No downloaded episodes on this device yet.'),
+                );
+              }
+              final preview = downloads.take(5).toList();
+              return Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'On this device (${downloads.length})',
+                    style: theme.textTheme.titleMedium,
+                  ),
+                  const SizedBox(height: 8),
+                  ...preview.map(
+                    (e) => ListTile(
+                      contentPadding: EdgeInsets.zero,
+                      leading: const Icon(Icons.download_done),
+                      title: Text(
+                        e.title ?? 'Untitled episode',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      subtitle: e.podcast == null
+                          ? null
+                          : Text(
+                              e.podcast!,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                      trailing: const Icon(Icons.play_arrow),
+                      onTap: () => _playLocalDownload(e),
+                    ),
+                  ),
+                ],
+              );
+            },
+          ),
+          const SizedBox(height: 16),
+          ElevatedButton.icon(
+            onPressed: _goToDownloads,
+            icon: const Icon(Icons.download),
+            label: const Text('Go to Downloads'),
+          ),
+          const SizedBox(height: 8),
+          OutlinedButton.icon(
+            onPressed: () {
+              ConnectivityService.instance.refresh();
+              _loadHomeContent();
+            },
+            icon: const Icon(Icons.refresh),
+            label: const Text('Retry connection'),
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     // Show context menu as a modal overlay if needed
@@ -729,16 +896,16 @@ class _PinepodsHomeState extends State<PinepodsHome> {
             ),
           )
         else if (_errorMessage.isNotEmpty)
-          ServerErrorPage(
-            errorMessage: _errorMessage.isServerConnectionError 
-              ? null 
-              : _errorMessage,
-            onRetry: _loadHomeContent,
-            title: 'Home Unavailable',
-            subtitle: _errorMessage.isServerConnectionError
-              ? 'Unable to connect to the PinePods server'
-              : 'Failed to load home content',
-          )
+          if (_errorMessage.isServerConnectionError ||
+              ConnectivityService.instance.isOffline)
+            _buildOfflineHome()
+          else
+            ServerErrorPage(
+              errorMessage: _errorMessage,
+              onRetry: _loadHomeContent,
+              title: 'Home Unavailable',
+              subtitle: 'Failed to load home content',
+            )
         else if (_homeData != null)
           Padding(
             padding: const EdgeInsets.all(16.0),

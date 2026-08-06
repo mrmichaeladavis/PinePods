@@ -12,7 +12,7 @@ use wasm_bindgen_futures::spawn_local;
 use web_sys::console;
 use yewdux::prelude::*;
 
-use crate::components::context::{AppState, EpisodeStatusState, NotificationState};
+use crate::components::context::{AppState, EpisodeStatusState, NotificationMessage, NotificationState};
 use crate::components::notification_center::TaskProgress;
 
 // Response structs
@@ -33,6 +33,18 @@ struct BackendTaskInfo {
     pub created_at: String,
     pub updated_at: String,
     pub result: Option<serde_json::Value>,
+    #[serde(default)]
+    pub completed_at: Option<String>,
+    #[serde(default)]
+    pub art_url: Option<String>,
+    #[serde(default)]
+    pub detail: Option<String>,
+    #[serde(default)]
+    pub group: Option<String>,
+    #[serde(default)]
+    pub group_label: Option<String>,
+    #[serde(default)]
+    pub total: Option<i32>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -42,6 +54,10 @@ struct TaskUpdateMessage {
     tasks: Option<Vec<BackendTaskInfo>>,
     #[serde(default)]
     task: Option<RawTaskProgress>,
+    #[serde(default)]
+    notifications: Option<Vec<NotificationMessage>>,
+    #[serde(default)]
+    notification: Option<NotificationMessage>,
 }
 
 // New struct specifically for parsing the raw data coming from the server
@@ -58,6 +74,16 @@ struct RawTaskProgress {
     pub completed_at: Option<String>,
     #[serde(default)]
     pub details: Option<HashMap<String, Value>>, // Also using Value for details
+    #[serde(default)]
+    pub art_url: Option<String>,
+    #[serde(default)]
+    pub detail: Option<String>,
+    #[serde(default)]
+    pub group: Option<String>,
+    #[serde(default)]
+    pub group_label: Option<String>,
+    #[serde(default)]
+    pub total: Option<i32>,
 }
 
 // Convert BackendTaskInfo to TaskProgress
@@ -92,6 +118,10 @@ impl From<BackendTaskInfo> for TaskProgress {
 
         // Check if task is completed before moving values
         let is_completed = backend_task.status == "SUCCESS" || backend_task.status == "FAILED";
+        let completed_at = backend_task
+            .completed_at
+            .clone()
+            .or_else(|| is_completed.then(|| backend_task.updated_at.clone()));
 
         TaskProgress {
             task_id: backend_task.id,
@@ -101,18 +131,35 @@ impl From<BackendTaskInfo> for TaskProgress {
             progress: backend_task.progress,
             status: backend_task.status,
             started_at: backend_task.created_at,
-            completed_at: if is_completed {
-                Some(backend_task.updated_at)
-            } else {
-                None
-            },
+            completed_at: completed_at.clone(),
             details: Some(details),
+            // Prefer the server completion timestamp for relative-time; fall back to
+            // "now" so a task that arrives already-complete still sorts sensibly.
             completion_time: if is_completed {
-                Some(js_sys::Date::now())
+                completed_at
+                    .as_deref()
+                    .and_then(parse_rfc3339_ms)
+                    .or_else(|| Some(js_sys::Date::now()))
             } else {
                 None
             },
+            art_url: backend_task.art_url,
+            detail: backend_task.detail,
+            group: backend_task.group,
+            group_label: backend_task.group_label,
+            total: backend_task.total,
         }
+    }
+}
+
+/// Parse an RFC3339 timestamp to JS epoch-ms via the browser Date parser.
+/// Returns None on unparseable input.
+pub fn parse_rfc3339_ms(s: &str) -> Option<f64> {
+    let ms = js_sys::Date::parse(s);
+    if ms.is_nan() {
+        None
+    } else {
+        Some(ms)
     }
 }
 
@@ -214,15 +261,44 @@ pub async fn connect_to_task_websocket(
                         Ok(update) => {
                             match update.event.as_str() {
                                 "initial" | "refresh" => {
-                                    if let Some(backend_tasks) = update.tasks {
-                                        // Convert BackendTaskInfo to TaskProgress
-                                        let tasks: Vec<TaskProgress> = backend_tasks
-                                            .into_iter()
-                                            .map(|t| t.into())
-                                            .collect();
+                                    let tasks: Option<Vec<TaskProgress>> = update
+                                        .tasks
+                                        .map(|bt| bt.into_iter().map(|t| t.into()).collect());
+                                    let notifications = update.notifications;
 
-                                        dispatch_clone.reduce_mut(|state| {
+                                    dispatch_clone.reduce_mut(|state| {
+                                        if let Some(tasks) = tasks {
                                             state.active_tasks = Some(tasks);
+                                        }
+                                        if let Some(notifs) = notifications {
+                                            state.messages = notifs;
+                                        }
+                                    });
+                                }
+                                "notification" => {
+                                    if let Some(notif) = update.notification {
+                                        dispatch_clone.reduce_mut(|state| {
+                                            // Upsert by id (dedupes bridge echoes / reconnects).
+                                            if let Some(existing) = state
+                                                .messages
+                                                .iter_mut()
+                                                .find(|m| m.id == notif.id)
+                                            {
+                                                *existing = notif.clone();
+                                            } else {
+                                                state.messages.insert(0, notif.clone());
+                                            }
+                                        });
+                                        // Flash a transient toast so a brand-new alert is noticed.
+                                        let toast = notif.title.clone();
+                                        let is_err = notif.severity == "error"
+                                            || notif.severity == "warning";
+                                        dispatch_clone.reduce_mut(move |state| {
+                                            if is_err {
+                                                state.error_message = Some(toast);
+                                            } else {
+                                                state.info_message = Some(toast);
+                                            }
                                         });
                                     }
                                 }
@@ -337,6 +413,8 @@ pub async fn connect_to_task_websocket(
                                                 .insert("status_text".to_string(), default_status);
                                         }
 
+                                        let is_done = raw_task.status == "SUCCESS"
+                                            || raw_task.status == "FAILED";
                                         let task = TaskProgress {
                                             task_id: raw_task.task_id,
                                             user_id: raw_task.user_id,
@@ -345,16 +423,24 @@ pub async fn connect_to_task_websocket(
                                             progress: raw_task.progress,
                                             status: raw_task.status.clone(),
                                             started_at: raw_task.started_at,
-                                            completed_at: raw_task.completed_at,
+                                            completed_at: raw_task.completed_at.clone(),
                                             details: Some(details),
-                                            // Add a timestamp for auto-removal of completed tasks
-                                            completion_time: if raw_task.status == "SUCCESS"
-                                                || raw_task.status == "FAILED"
-                                            {
-                                                Some(js_sys::Date::now())
+                                            // Completion timestamp drives the "Done" relative-time
+                                            // label + ordering (no longer auto-removal).
+                                            completion_time: if is_done {
+                                                raw_task
+                                                    .completed_at
+                                                    .as_deref()
+                                                    .and_then(parse_rfc3339_ms)
+                                                    .or_else(|| Some(js_sys::Date::now()))
                                             } else {
                                                 None
                                             },
+                                            art_url: raw_task.art_url,
+                                            detail: raw_task.detail,
+                                            group: raw_task.group,
+                                            group_label: raw_task.group_label,
+                                            total: raw_task.total,
                                         };
 
                                         // If a podcast download failed, revert the optimistic
@@ -420,18 +506,8 @@ pub async fn connect_to_task_websocket(
                                                 tasks.push(task.clone());
                                             }
 
-                                            // Auto-cleanup completed tasks after a delay
-                                            tasks.retain(|t| {
-                                                if let Some(completion_time) = t.completion_time {
-                                                    // Remove completed tasks after 30 seconds (30000 ms)
-                                                    const TASK_DISPLAY_DURATION: f64 = 30000.0;
-                                                    let current_time = js_sys::Date::now();
-                                                    return (current_time - completion_time)
-                                                        < TASK_DISPLAY_DURATION;
-                                                }
-                                                true
-                                            });
-
+                                            // Completed tasks now persist in the "Done" tab until the
+                                            // user clears them (the old 30s auto-yank felt buggy).
                                             state.active_tasks = Some(tasks);
                                         });
                                     }

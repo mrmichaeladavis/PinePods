@@ -320,7 +320,7 @@ pub fn startpage() -> Html {
             <div class="settings-row">
                 <div>
                     <div class="settings-row-label">{i18n.t("collections.add_mode")}</div>
-                    <div class="settings-row-description">{i18n.t("collections.add_mode_description")}</div>
+                    <div class="settings-row-desc">{i18n.t("collections.add_mode_description")}</div>
                 </div>
                 <div class="settings-row-control">
                     if *collection_loading {

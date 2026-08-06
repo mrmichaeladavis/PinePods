@@ -19,6 +19,7 @@ pub mod rss_feeds;
 pub mod start_page_options;
 pub mod theme_options;
 pub mod ai_settings;
+pub mod ytdlp_settings;
 pub mod user_self_service;
 pub mod user_self_settings;
 pub mod user_settings;

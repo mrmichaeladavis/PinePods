@@ -508,7 +508,7 @@ fn process_node(
                                                             is_video: ev_is_video,
                                                         });
                                                         state.set_media_source(url_clone.clone(), ev_is_video, dispatch_for_media);
-                                                        let session_vol = state.audio_volume;
+                                                        let session_vol = state.effective_volume();
                                                         if let Some(media) = &state.media_element {
                                                             media.set_current_time(seconds as f64);
                                                             // Apply the live session volume to the new element (#828/#775)

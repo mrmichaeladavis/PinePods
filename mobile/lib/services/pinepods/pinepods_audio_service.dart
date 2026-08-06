@@ -8,6 +8,7 @@ import 'package:pinepods_mobile/entities/chapter.dart';
 import 'package:pinepods_mobile/entities/person.dart';
 import 'package:pinepods_mobile/entities/transcript.dart';
 import 'package:pinepods_mobile/services/audio/audio_player_service.dart';
+import 'package:pinepods_mobile/services/nowplaying/nowplaying_service.dart';
 import 'package:pinepods_mobile/services/offline/offline_action_queue.dart';
 import 'package:pinepods_mobile/services/pinepods/pinepods_service.dart';
 import 'package:pinepods_mobile/bloc/settings/settings_bloc.dart';
@@ -28,6 +29,24 @@ class PinepodsAudioService {
   int? _currentEpisodeId;
   int? _currentUserId;
   bool _isYoutube = false;
+
+  /// Title/artwork of the current episode, cached so now-playing reports can
+  /// describe what this device is playing without another lookup.
+  String? _currentTitle;
+  String? _currentArtwork;
+
+  /// Latest playback state, tracked so now-playing reports carry an accurate
+  /// playing/paused flag (the audio service's playingState is a plain Stream).
+  bool _isPlaying = false;
+  StreamSubscription<AudioState>? _playingStateSub;
+
+  /// Best-effort now-playing reporter (cross-device awareness + remote control).
+  /// Optional: a null service, or one that isn't connected, never affects playback.
+  NowPlayingService? _nowPlayingService;
+
+  /// Public getters used by the now-playing reporter.
+  int? get currentEpisodeId => _currentEpisodeId;
+  bool get isYoutube => _isYoutube;
 
   /// The playlist the current episode is being played from, if any. Used to
   /// continue playback through the playlist when an episode completes.
@@ -52,11 +71,22 @@ class PinepodsAudioService {
     Function()? onPauseCallback,
     Function()? onStopCallback,
   }) : _onPauseCallback = onPauseCallback,
-       _onStopCallback = onStopCallback;
+       _onStopCallback = onStopCallback {
+    // Track playback state so now-playing reports carry an accurate flag.
+    _playingStateSub = _audioPlayerService.playingState?.listen((state) {
+      _isPlaying =
+          state == AudioState.playing || state == AudioState.buffering;
+    });
+  }
 
   /// Wire up the offline outbox (called once during app start-up).
   void setActionQueue(OfflineActionQueue queue) {
     _actionQueue = queue;
+  }
+
+  /// Wire up the now-playing reporter (called once during app start-up).
+  void setNowPlayingService(NowPlayingService service) {
+    _nowPlayingService = service;
   }
 
   void setPlaylistContext(int? playlistId) {
@@ -111,12 +141,66 @@ class PinepodsAudioService {
 
       _currentEpisodeId = episodeId;
       _currentEpisodeDuration = pinepodsEpisode.episodeDuration;
+      _currentTitle = pinepodsEpisode.episodeTitle;
+      _currentArtwork = pinepodsEpisode.episodeArtwork;
 
       // Is there a local download for this episode? If so we play the on-disk
       // file and tolerate the server being unreachable for everything else.
       final localDownload = await _audioPlayerService.findDownloadedEpisode(episodeId);
       final hasLocalDownload = localDownload != null;
 
+      // Offline-first fast path (#935): a local download plays entirely from
+      // disk, so start it immediately and defer every server round-trip. This
+      // means tapping a downloaded episode with the server unreachable begins
+      // playback right away instead of stalling ~30s on API timeouts.
+      if (hasLocalDownload) {
+        final localEpisode = _convertToEpisode(
+          pinepodsEpisode,
+          PlayEpisodeDetails(playbackSpeed: 1.0, startSkip: 0, endSkip: 0),
+          null,
+        );
+        // Select the on-disk file. As in the streaming path we set only
+        // downloadState + the file location (NOT downloadPercentage) so this
+        // transient playback record doesn't masquerade as a second entry in the
+        // downloads list.
+        localEpisode.downloadState = DownloadState.downloaded;
+        localEpisode.filepath = localDownload.filepath;
+        localEpisode.filename = localDownload.filename;
+        // Reuse metadata already stored with the download (chapters/persons/
+        // transcript) so the now-playing view is fully populated with no
+        // network round-trip.
+        localEpisode.chapters = localDownload.chapters;
+        localEpisode.persons = localDownload.persons;
+        localEpisode.chaptersUrl = localDownload.chaptersUrl;
+        localEpisode.transcript = localDownload.transcript;
+        localEpisode.transcriptId = localDownload.transcriptId;
+        log.info('Playing local download for episode $episodeId (offline fast path)');
+
+        await _audioPlayerService.playEpisode(episode: localEpisode, resume: resume);
+
+        // Add to history via the offline outbox (buffered locally when offline).
+        final initialPosition =
+            resume ? (pinepodsEpisode.listenDuration ?? 0).toDouble() : 0.0;
+        await _recordPosition(episodeId, userId, initialPosition);
+
+        _startPeriodicUpdates();
+        _isPlaying = true;
+        _reportNowPlaying();
+
+        // Apply server-side niceties (speed, skip ranges, queue anchor, played
+        // count) in the background. Best-effort — never blocks/fails playback.
+        unawaited(_enrichLocalPlayback(
+          pinepodsEpisode: pinepodsEpisode,
+          episodeId: episodeId,
+          userId: userId,
+          resume: resume,
+          skipQueue: skipQueue,
+        ));
+        return;
+      }
+
+      // Streaming / server-backed path: these values are required up front (no
+      // local file to fall back to), so we fetch them before playback starts.
       // Get podcast ID for settings, and podcast 2.0 data (chapters/persons/
       // transcripts) in parallel - these two calls don't depend on each other,
       // and running them sequentially only adds latency before playback starts.
@@ -149,23 +233,6 @@ class PinepodsAudioService {
       // Convert PinepodsEpisode to Episode for the audio player
       final episode = _convertToEpisode(pinepodsEpisode, playDetails, podcast2Data);
 
-      // Prefer the locally-downloaded file when one exists so playback works
-      // offline and avoids needless streaming.
-      //
-      // We set only downloadState (which is what selects the on-disk file) plus
-      // the file location. We deliberately do NOT set downloadPercentage = 100:
-      // this is a transient playback record whose guid is the content URL, not
-      // 'pinepods_<id>'. Marking it as a complete download would make it show up
-      // as a SECOND entry in the downloads list (with a bogus duration, since
-      // this record's duration is in milliseconds). The real 'pinepods_<id>'
-      // record stays the single source of truth for the downloads list.
-      if (hasLocalDownload) {
-        episode.downloadState = DownloadState.downloaded;
-        episode.filepath = localDownload.filepath;
-        episode.filename = localDownload.filename;
-        log.info('Playing local download for episode $episodeId');
-      }
-
       // Start playing with the existing audio service
       await _audioPlayerService.playEpisode(episode: episode, resume: resume);
 
@@ -188,7 +255,9 @@ class PinepodsAudioService {
       final initialPosition = resume ? (pinepodsEpisode.listenDuration ?? 0).toDouble() : 0.0;
       await _recordPosition(episodeId, userId, initialPosition);
 
-      // Queue episode for tracking (skip if auto-play-next is enabled or explicitly skipped)
+      // Playing an episode makes it the queue anchor: move it to the top of the
+      // queue (inserting it if not already queued). Skipped for playlist/serial
+      // auto-play-next contexts, which stay out of the queue.
       bool shouldQueue = !skipQueue;
       if (shouldQueue) {
         try {
@@ -202,13 +271,13 @@ class PinepodsAudioService {
       }
       if (shouldQueue) {
         try {
-          await _pinepodsService.queueEpisode(
+          await _pinepodsService.moveQueueEpisodeToTop(
             episodeId,
             userId,
             pinepodsEpisode.isYoutube,
           );
         } catch (e) {
-          log.fine('Could not queue episode (continuing): $e');
+          log.fine('Could not move episode to top of queue (continuing): $e');
         }
       }
 
@@ -221,10 +290,105 @@ class PinepodsAudioService {
 
       // Start periodic updates
       _startPeriodicUpdates();
+
+      // Report the new now-playing state immediately so other devices see the
+      // switch without waiting for the next tick (best-effort).
+      _isPlaying = true;
+      _reportNowPlaying();
     } catch (e) {
       log.severe('Error playing PinePods episode: $e');
       rethrow;
     }
+  }
+
+  /// Background, best-effort application of server-side playback niceties for a
+  /// local download that is already playing (speed override, intro skip, ad/
+  /// silence skip ranges, queue anchoring, played count). Runs unawaited and
+  /// never throws; when the server is unreachable these calls fail fast / return
+  /// defaults and local playback is unaffected. The [_currentEpisodeId] guards
+  /// avoid applying stale enrichment if the user has since switched episodes.
+  Future<void> _enrichLocalPlayback({
+    required PinepodsEpisode pinepodsEpisode,
+    required int episodeId,
+    required int userId,
+    required bool resume,
+    required bool skipQueue,
+  }) async {
+    try {
+      final podcastId = await _pinepodsService
+          .getPodcastIdFromEpisode(episodeId, userId, pinepodsEpisode.isYoutube)
+          .catchError((_) => 0);
+
+      final playDetails = await _pinepodsService
+          .getPlayEpisodeDetails(userId, podcastId, pinepodsEpisode.isYoutube);
+
+      if (_currentEpisodeId == episodeId) {
+        await _audioPlayerService.setPlaybackSpeed(playDetails.playbackSpeed);
+
+        if (playDetails.startSkip > 0 && !resume) {
+          await _audioPlayerService.seek(position: playDetails.startSkip);
+        }
+
+        await refreshSkipSegments(episodeId, userId, podcastId);
+      }
+
+      if (!skipQueue) {
+        bool shouldQueue = true;
+        try {
+          final autoPlayNext =
+              await _pinepodsService.getAutoPlayNextStatus(podcastId, userId);
+          if (autoPlayNext) shouldQueue = false;
+        } catch (e) {
+          log.fine('Could not check auto-play-next status: $e');
+        }
+        if (shouldQueue) {
+          try {
+            await _pinepodsService.moveQueueEpisodeToTop(
+                episodeId, userId, pinepodsEpisode.isYoutube);
+          } catch (e) {
+            log.fine('Could not move episode to top of queue (continuing): $e');
+          }
+        }
+      }
+
+      try {
+        await _pinepodsService.incrementPlayed(userId);
+      } catch (e) {
+        log.fine('Could not increment played count (continuing): $e');
+      }
+    } catch (e) {
+      log.fine('Local playback enrichment failed (continuing): $e');
+    }
+  }
+
+  /// Report this device's current playback to the now-playing socket. Purely
+  /// best-effort: no-ops when no episode is loaded or no reporter is wired, and
+  /// never touches local playback.
+  void _reportNowPlaying({bool? playingOverride}) {
+    final nps = _nowPlayingService;
+    final episodeId = _currentEpisodeId;
+    if (nps == null || episodeId == null) return;
+
+    // valueOrNull (not .value): playPosition is an unseeded BehaviorSubject, so
+    // .value throws until the first position event — and the play-start report
+    // below runs before that, inside a try that would rethrow and break playback.
+    final positionState = _audioPlayerService.playPosition?.valueOrNull;
+    final positionSec =
+        positionState?.position.inSeconds.toDouble() ?? _lastRecordedPosition;
+    final durationSec = (positionState != null && positionState.length.inSeconds > 0)
+        ? positionState.length.inSeconds.toDouble()
+        : (_currentEpisodeDuration ?? 0).toDouble();
+
+    nps.reportNowPlaying(
+      episodeId: episodeId,
+      isYoutube: _isYoutube,
+      title: _currentTitle ?? '',
+      artworkUrl: _currentArtwork ?? '',
+      positionSec: positionSec,
+      durationSec: durationSec,
+      playing: playingOverride ?? _isPlaying,
+      speed: _settingsBloc.currentSettings.playbackSpeed,
+    );
   }
 
   /// Fetch the server-detected skip segments for an episode and push the active
@@ -265,10 +429,15 @@ class PinepodsAudioService {
   void _startPeriodicUpdates() {
     _stopPeriodicUpdates(); // Clean up any existing timers
 
-    // Episode position updates every 15 seconds (more frequent for reliability)
+    // Episode position updates every 15 seconds (more frequent for reliability).
+    // Also drives the best-effort now-playing report, which doubles as the
+    // snapshot-TTL heartbeat while paused (the timer keeps running until dispose).
     _episodeUpdateTimer = Timer.periodic(
       const Duration(seconds: 15),
-      (_) => _safeUpdateEpisodePosition(),
+      (_) {
+        _safeUpdateEpisodePosition();
+        _reportNowPlaying();
+      },
     );
 
     // User listen time updates every 60 seconds
@@ -617,6 +786,9 @@ class PinepodsAudioService {
 
   /// Handle pause event - sync position to server
   Future<void> onPause() async {
+    _isPlaying = false;
+    // Best-effort: let other devices see the pause promptly.
+    _reportNowPlaying(playingOverride: false);
     try {
       await syncCurrentPositionToServer();
       log.info('Pause event handled - position synced to server');
@@ -810,10 +982,14 @@ class PinepodsAudioService {
   /// Clean up resources
   void dispose() {
     _stopPeriodicUpdates();
+    _playingStateSub?.cancel();
+    _playingStateSub = null;
     _currentEpisodeId = null;
     _currentUserId = null;
     _currentPlaylistId = null;
     _currentEpisodeDuration = null;
+    _currentTitle = null;
+    _currentArtwork = null;
   }
 }
 

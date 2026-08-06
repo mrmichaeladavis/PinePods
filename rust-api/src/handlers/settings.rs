@@ -4693,6 +4693,109 @@ pub async fn update_ai_settings(
     Ok(Json(serde_json::json!({ "detail": "AI settings updated." })))
 }
 
+#[utoipa::path(
+    get,
+    path = "/ytdlp_settings",
+    tag = "settings",
+    summary = "Get yt-dlp management settings + current version (admin)",
+    security(("api_key" = [])),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+        (status = 401, description = "Invalid or missing API key"),
+        (status = 403, description = "Admin access required"),
+    ),
+)]
+pub async fn get_ytdlp_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let api_key = extract_api_key(&headers)?;
+    validate_api_key(&state, &api_key).await?;
+    let key_id = state.db_pool.get_user_id_from_api_key(&api_key).await?;
+    if !state.db_pool.user_admin_check(key_id).await? {
+        return Err(AppError::forbidden("Admin access required."));
+    }
+
+    let settings = crate::services::ytdlp::get_settings(&state.db_pool)
+        .await
+        .map_err(|e| AppError::internal(&e))?;
+    // Live version is best-effort; None if the binary is missing/broken (surfaced in the UI).
+    let version = crate::services::ytdlp::current_version().await.ok();
+
+    Ok(Json(serde_json::json!({ "settings": settings, "version": version })))
+}
+
+#[utoipa::path(
+    post,
+    path = "/ytdlp_settings",
+    tag = "settings",
+    summary = "Update yt-dlp management settings (admin)",
+    request_body = crate::services::ytdlp::YtDlpSettingsUpdate,
+    security(("api_key" = [])),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+        (status = 401, description = "Invalid or missing API key"),
+        (status = 403, description = "Admin access required"),
+    ),
+)]
+pub async fn update_ytdlp_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<crate::services::ytdlp::YtDlpSettingsUpdate>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let api_key = extract_api_key(&headers)?;
+    validate_api_key(&state, &api_key).await?;
+    let key_id = state.db_pool.get_user_id_from_api_key(&api_key).await?;
+    if !state.db_pool.user_admin_check(key_id).await? {
+        return Err(AppError::forbidden("Admin access required."));
+    }
+
+    crate::services::ytdlp::set_settings(&state.db_pool, &request)
+        .await
+        .map_err(|e| AppError::internal(&e))?;
+
+    Ok(Json(serde_json::json!({ "detail": "yt-dlp settings updated." })))
+}
+
+#[utoipa::path(
+    post,
+    path = "/ytdlp_update",
+    tag = "settings",
+    summary = "Trigger an immediate yt-dlp self-update (admin)",
+    security(("api_key" = [])),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+        (status = 401, description = "Invalid or missing API key"),
+        (status = 403, description = "Admin access required"),
+    ),
+)]
+pub async fn trigger_ytdlp_update(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let api_key = extract_api_key(&headers)?;
+    validate_api_key(&state, &api_key).await?;
+    let key_id = state.db_pool.get_user_id_from_api_key(&api_key).await?;
+    if !state.db_pool.user_admin_check(key_id).await? {
+        return Err(AppError::forbidden("Admin access required."));
+    }
+
+    // Runs synchronously (a self-update takes a few seconds) so the button gets immediate
+    // feedback; the result is also persisted for the settings page. A failed update keeps the
+    // existing working binary.
+    match crate::services::ytdlp::update_and_record(&state.db_pool).await {
+        Ok(version) => Ok(Json(serde_json::json!({
+            "success": true,
+            "version": version,
+            "detail": format!("yt-dlp updated to {}", version),
+        }))),
+        Err(e) => Ok(Json(serde_json::json!({
+            "success": false,
+            "detail": format!("Update failed: {}", e),
+        }))),
+    }
+}
+
 #[derive(Deserialize, utoipa::IntoParams)]
 pub struct AiModelsQuery {
     pub remote_url: Option<String>,

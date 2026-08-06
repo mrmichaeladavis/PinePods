@@ -1,0 +1,268 @@
+// Remote-devices panel: shows the user's other active devices and what they're
+// playing, with advisory transport controls + "play here". Sends commands over the
+// now-playing WebSocket; the target device applies them to its local player.
+
+use serde_json::json;
+use wasm_bindgen_futures::spawn_local;
+use yew::prelude::*;
+use yewdux::prelude::*;
+
+use crate::components::audio::on_play_click;
+use crate::components::context::{AppState, UIState};
+use crate::requests::now_playing::{
+    send_command, NowPlayingDevice, NowPlayingState, PendingRemotePlay,
+};
+use crate::requests::pod_req::{call_get_episode_metadata, EpisodeRequest};
+
+fn fmt_time(secs: f64) -> String {
+    if !secs.is_finite() || secs < 0.0 {
+        return "00:00".to_string();
+    }
+    let total = secs as i64;
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    let s = total % 60;
+    if h > 0 {
+        format!("{}:{:02}:{:02}", h, m, s)
+    } else {
+        format!("{:02}:{:02}", m, s)
+    }
+}
+
+#[function_component(RemoteDevices)]
+pub fn remote_devices() -> Html {
+    let (np_state, np_dispatch) = use_store::<NowPlayingState>();
+    let (app_state, _) = use_store::<AppState>();
+    let (ui_state, ui_dispatch) = use_store::<UIState>();
+    let open = use_state(|| false);
+
+    // Observe "Play here" / inbound remote-play requests and start playback on THIS
+    // device. This lives here (not in AudioPlayer) because AudioPlayer only mounts
+    // once something is already playing locally — an idle tab must still be able to
+    // START remote playback, and this component is always mounted in the topbar.
+    {
+        let np_dispatch = np_dispatch.clone();
+        let server_name = app_state
+            .auth_details
+            .as_ref()
+            .map(|ad| ad.server_name.clone());
+        let api_key = app_state.auth_details.as_ref().map(|ad| ad.api_key.clone());
+        let user_id = app_state.user_details.as_ref().map(|ud| ud.UserID);
+        let ui_dispatch = ui_dispatch.clone();
+        let ui_state = ui_state.clone();
+        use_effect_with(np_state.pending_remote_play.clone(), move |pending| {
+            if let Some(pending) = pending.clone() {
+                let ep_id = pending.episode_id;
+                let is_youtube = pending.is_youtube;
+                let resume_pos_sec = pending.resume_pos_sec;
+                // Clear immediately so it fires once.
+                np_dispatch.reduce_mut(|s| s.pending_remote_play = None);
+                if let (Some(server_name), Some(Some(api_key)), Some(user_id)) =
+                    (server_name.clone(), api_key.clone(), user_id)
+                {
+                    let ui_dispatch = ui_dispatch.clone();
+                    let ui_state = ui_state.clone();
+                    spawn_local(async move {
+                        let req = EpisodeRequest {
+                            episode_id: ep_id,
+                            user_id,
+                            person_episode: false,
+                            is_youtube,
+                        };
+                        match call_get_episode_metadata(&server_name, Some(api_key.clone()), &req)
+                            .await
+                        {
+                            Ok(mut ep) => {
+                                // Resume where the source device left off: on_play_click
+                                // starts at episode.listenduration, so override it with the
+                                // handed-off live position (fresher than the server's).
+                                if let Some(pos) = resume_pos_sec {
+                                    if pos.is_finite() && pos > 0.0 {
+                                        ep.listenduration = pos as i32;
+                                    }
+                                }
+                                on_play_click(
+                                    ep,
+                                    api_key,
+                                    user_id,
+                                    server_name,
+                                    ui_dispatch,
+                                    ui_state,
+                                    false,
+                                    false,
+                                    None,
+                                )
+                                .emit(MouseEvent::new("click").unwrap());
+                            }
+                            Err(e) => web_sys::console::warn_1(
+                                &format!("remote play_episode failed: {:?}", e).into(),
+                            ),
+                        }
+                    });
+                }
+            }
+            || ()
+        });
+    }
+
+    let toggle = {
+        let open = open.clone();
+        Callback::from(move |e: MouseEvent| {
+            e.stop_propagation();
+            open.set(!*open);
+        })
+    };
+    let close = {
+        let open = open.clone();
+        Callback::from(move |_: MouseEvent| open.set(false))
+    };
+    // Stop clicks inside the panel from bubbling to the topbar / closing it.
+    let stop = Callback::from(|e: MouseEvent| e.stop_propagation());
+
+    let device_count = np_state.devices.len();
+
+    let render_device = {
+        let np_dispatch = np_dispatch.clone();
+        move |device: &NowPlayingDevice| -> Html {
+            let id = device.device_id.clone();
+            let is_playing = device.playing;
+
+            let on_play_pause = {
+                let id = id.clone();
+                Callback::from(move |_: MouseEvent| {
+                    let action = if is_playing { "pause" } else { "play" };
+                    send_command(&id, action, json!({}));
+                })
+            };
+            let on_back = {
+                let id = id.clone();
+                Callback::from(move |_: MouseEvent| {
+                    send_command(&id, "skip_back", json!({ "seconds": 15 }));
+                })
+            };
+            let on_fwd = {
+                let id = id.clone();
+                Callback::from(move |_: MouseEvent| {
+                    send_command(&id, "skip_forward", json!({ "seconds": 30 }));
+                })
+            };
+            let on_play_here = {
+                let np_dispatch = np_dispatch.clone();
+                let episode_id = device.episode_id;
+                let is_youtube = device.is_youtube;
+                let position_sec = device.position_sec;
+                let source_id = id.clone();
+                let source_playing = is_playing;
+                Callback::from(move |_: MouseEvent| {
+                    // Taking over playback: pause the source device (best-effort,
+                    // advisory) so we're not playing the same thing in two places.
+                    if source_playing {
+                        send_command(&source_id, "pause", json!({}));
+                    }
+                    // Reuse the audio component's remote-play flow: it observes this
+                    // field, fetches the episode, and starts it locally — resuming at
+                    // the source's live position rather than the (staler) server one.
+                    np_dispatch.reduce_mut(|s| {
+                        s.pending_remote_play = Some(PendingRemotePlay {
+                            episode_id,
+                            is_youtube,
+                            resume_pos_sec: Some(position_sec),
+                        })
+                    });
+                })
+            };
+
+            let track = if device.title.is_empty() {
+                "Idle".to_string()
+            } else {
+                device.title.clone()
+            };
+            let progress = if device.duration_sec > 0.0 {
+                format!("{} / {}", fmt_time(device.position_sec), fmt_time(device.duration_sec))
+            } else {
+                fmt_time(device.position_sec)
+            };
+            let label = if device.device_name.is_empty() {
+                device.device_type.clone()
+            } else {
+                device.device_name.clone()
+            };
+
+            html! {
+                <div class="rd-row">
+                    <div class="rd-row-top">
+                        <span class="rd-name">
+                            <i class="ph ph-monitor"></i>{ label }
+                        </span>
+                        <span class={classes!("rd-state", is_playing.then_some("is-playing"))}>
+                            { if is_playing { "▶ playing" } else { "⏸ paused" } }
+                        </span>
+                    </div>
+                    <span class="rd-track">{ track }</span>
+                    <span class="rd-progress">{ progress }</span>
+                    <div class="rd-controls">
+                        // type="button" on every one: this drawer renders inside the
+                        // topbar search <form>, and a bare <button> defaults to submit —
+                        // which fired an empty-query search (proxy_search 500) and ate the
+                        // click so "Play here" never actually played.
+                        <button type="button" class="iconbtn" title="Skip back 15s" onclick={on_back}>
+                            <i class="ph ph-skip-back"></i>
+                        </button>
+                        <button type="button" class="iconbtn" title={ if is_playing { "Pause" } else { "Play" } } onclick={on_play_pause}>
+                            <i class={ if is_playing { "ph ph-pause" } else { "ph ph-play" } }></i>
+                        </button>
+                        <button type="button" class="iconbtn" title="Skip forward 30s" onclick={on_fwd}>
+                            <i class="ph ph-skip-forward"></i>
+                        </button>
+                        <button type="button" class="rd-play-here ml-auto" title="Play this here" onclick={on_play_here}>
+                            <i class="ph ph-monitor-play mr-1"></i>{ "Play here" }
+                        </button>
+                    </div>
+                </div>
+            }
+        }
+    };
+
+    html! {
+        <div class="remote-devices">
+            <button
+                type="button"
+                class="iconbtn"
+                title="Other devices"
+                onclick={toggle}
+            >
+                <i class="ph ph-broadcast text-2xl"></i>
+                if device_count > 0 {
+                    <span class="nc-bell-badge">
+                        { if device_count > 9 { "9+".to_string() } else { device_count.to_string() } }
+                    </span>
+                }
+            </button>
+
+            // Scrim + panel stay mounted; `.is-open` drives the two-way CSS
+            // transition (mirrors the Activity drawer) so closing animates too.
+            <div class={classes!("nc-scrim", (*open).then_some("is-open"))} onclick={close.clone()}></div>
+            <div class={classes!("nc-panel", "nc-form-drawer", (*open).then_some("is-open"))}
+                 data-density="compact" onclick={stop}>
+                <div class="nc-header">
+                    <h3 class="nc-h-title">{ "Other devices" }</h3>
+                    <div class="nc-h-spacer"></div>
+                    <button type="button" class="nc-h-btn" title="Close" onclick={close.clone()}>
+                        <i class="ph ph-arrow-line-right"></i>
+                    </button>
+                </div>
+                <div class="nc-body">
+                    if np_state.devices.is_empty() {
+                        <div class="nc-empty">
+                            <span class="nc-empty-ico"><i class="ph ph-broadcast"></i></span>
+                            <div class="nc-empty-t">{ "No other devices" }</div>
+                            <div class="nc-empty-s">{ "Devices playing on your account will show up here to view and control." }</div>
+                        </div>
+                    } else {
+                        { for np_state.devices.iter().map(|d| render_device(d)) }
+                    }
+                </div>
+            </div>
+        </div>
+    }
+}

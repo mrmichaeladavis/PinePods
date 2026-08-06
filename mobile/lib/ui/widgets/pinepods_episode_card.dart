@@ -178,6 +178,7 @@ class _PinepodsEpisodeCardState extends State<PinepodsEpisodeCard> {
             children: [
               LazyNetworkImage(
                 imageUrl: widget.episode.episodeArtwork,
+                localImagePath: widget.episode.localImagePath,
                 width: 50,
                 height: 50,
                 fit: BoxFit.cover,

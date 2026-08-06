@@ -12,7 +12,10 @@ use crate::requests::episode::Episode;
 use crate::requests::pod_req::Playlist;
 use crate::requests::pod_req::{self};
 
+use gloo_timers::future::TimeoutFuture;
 use i18nrs::yew::use_translation;
+use std::collections::HashSet;
+use wasm_bindgen_futures::spawn_local;
 use yew::prelude::*;
 use yew_router::history::{BrowserHistory, History};
 use yew_router::prelude::Link;
@@ -67,6 +70,117 @@ fn weekly_stats_card(props: &WeeklyStatsProps) -> Html {
                         <span class="weekly-stat-label">{ completed }</span>
                     </div>
                 </div>
+            </div>
+        </div>
+    }
+}
+
+#[derive(Properties, PartialEq, Clone)]
+struct ContinueListeningProps {
+    episodes: Vec<Episode>,
+}
+
+/// Renders the home "Continue Listening" section. Shows up to 3 in-progress episodes and
+/// reactively removes any that get marked complete (via the shared
+/// `EpisodeStatusState.completed_episodes` set), animating the card out and sliding the next
+/// queued episode into its place. Hides itself when nothing is left to show.
+#[function_component(ContinueListening)]
+fn continue_listening(props: &ContinueListeningProps) -> Html {
+    let (i18n, _) = use_translation();
+    let continue_listening_label = i18n.t("home.continue_listening").to_string();
+
+    let completed = use_selector(|state: &EpisodeStatusState| state.completed_episodes.clone());
+    // Ids mid-exit-animation (still mounted) and ids fully removed for this session.
+    let leaving = use_state(HashSet::<i32>::new);
+    let removed = use_state(HashSet::<i32>::new);
+
+    // Reset local state whenever the underlying list changes (e.g. a fresh home fetch),
+    // so a refreshed list shows in full again.
+    {
+        let leaving = leaving.clone();
+        let removed = removed.clone();
+        use_effect_with(props.episodes.clone(), move |_| {
+            leaving.set(HashSet::new());
+            removed.set(HashSet::new());
+            || ()
+        });
+    }
+
+    // The currently-visible window: first 3 episodes that haven't been fully removed yet.
+    // A "leaving" episode is not yet in `removed`, so it keeps its slot during the exit
+    // animation and the 4th card only surfaces once the animation completes.
+    let visible: Vec<Episode> = props
+        .episodes
+        .iter()
+        .filter(|ep| !removed.contains(&ep.episodeid))
+        .take(3)
+        .cloned()
+        .collect();
+
+    // When a visible episode becomes completed, animate it out then remove it.
+    {
+        let leaving = leaving.clone();
+        let removed_state = removed.clone();
+        let visible_ids: Vec<i32> = visible.iter().map(|ep| ep.episodeid).collect();
+        use_effect_with(
+            (completed.clone(), (*removed).clone()),
+            move |(completed, _removed)| {
+                // Collect every newly-completed visible id first, then apply a single
+                // state update, so simultaneous completions don't clobber each other.
+                let newly_leaving: Vec<i32> = visible_ids
+                    .into_iter()
+                    .filter(|id| {
+                        completed.contains(id)
+                            && !leaving.contains(id)
+                            && !removed_state.contains(id)
+                    })
+                    .collect();
+
+                if !newly_leaving.is_empty() {
+                    let mut next_leaving = (*leaving).clone();
+                    for id in &newly_leaving {
+                        next_leaving.insert(*id);
+                    }
+                    leaving.set(next_leaving);
+
+                    for id in newly_leaving {
+                        let leaving = leaving.clone();
+                        let removed_state = removed_state.clone();
+                        spawn_local(async move {
+                            TimeoutFuture::new(400).await;
+                            let mut next_removed = (*removed_state).clone();
+                            next_removed.insert(id);
+                            removed_state.set(next_removed);
+                            let mut next_leaving = (*leaving).clone();
+                            next_leaving.remove(&id);
+                            leaving.set(next_leaving);
+                        });
+                    }
+                }
+                || ()
+            },
+        );
+    }
+
+    if visible.is_empty() {
+        return html! {};
+    }
+
+    html! {
+        <div class="section-container">
+            <h2 class="text-2xl font-bold mb-4 item_container-text">{ continue_listening_label }</h2>
+            <div class="continue-list">
+                { for visible.iter().map(|episode| {
+                    let is_leaving = leaving.contains(&episode.episodeid);
+                    html! {
+                        <div
+                            key={episode.episodeid}
+                            class={classes!("continue-item", is_leaving.then_some("leaving"))}
+                        >
+                            <EpisodeListItem episode={ episode.clone() } />
+                        </div>
+                    }
+                })}
             </div>
         </div>
     }
@@ -224,7 +338,6 @@ pub fn home() -> Html {
     let i18n_history = i18n.t("app_drawer.history").to_string();
     let i18n_feed = i18n.t("app_drawer.feed").to_string();
     let i18n_podcasts = i18n.t("app_drawer.podcasts").to_string();
-    let i18n_continue_listening = i18n.t("home.continue_listening").to_string();
     let i18n_up_next = i18n.t("home.up_next").to_string();
     let i18n_top_podcasts = i18n.t("home.top_podcasts").to_string();
     let i18n_smart_playlists = i18n.t("home.smart_playlists").to_string();
@@ -390,27 +503,8 @@ pub fn home() -> Html {
                             episodes_completed={home_data.weekly_stats.episodes_completed}
                         />
 
-                        {
-                            if !home_data.in_progress_episodes.is_empty() {
-                                html! {
-                                    <div class="section-container">
-                                        <h2 class="text-2xl font-bold mb-4 item_container-text">{&i18n_continue_listening}</h2>
-                                        <div class="space-y-4">
-                                            { for home_data.in_progress_episodes.iter().take(3).map(|episode| {
-                                                html! {
-                                                    <EpisodeListItem
-                                                        key={episode.episodeid}
-                                                        episode={ episode.clone() }
-                                                    />
-                                                }
-                                            })}
-                                        </div>
-                                    </div>
-                                }
-                            } else {
-                                html! {}
-                            }
-                        }
+                        <ContinueListening episodes={home_data.in_progress_episodes.clone()} />
+
 
                         // Up Next Section (queue preview)
                         {

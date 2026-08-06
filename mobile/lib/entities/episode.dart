@@ -69,6 +69,14 @@ class Episode {
   /// URL to a thumbnail version of the episode artwork image.
   String? thumbImageUrl;
 
+  /// Absolute path to a locally-cached copy of the episode artwork, downloaded
+  /// alongside the audio so covers render when the server is unreachable (#935).
+  /// Null when no local copy exists (stream-only or older downloads). Rendering
+  /// verifies the file still exists and falls back to the remote URL otherwise,
+  /// so a stale path (e.g. after an iOS app-container change) degrades to a
+  /// placeholder rather than breaking.
+  String? localImagePath;
+
   /// The date the episode was published (if known).
   DateTime? publicationDate;
 
@@ -155,6 +163,7 @@ class Episode {
     this.link,
     String? imageUrl,
     String? thumbImageUrl,
+    this.localImagePath,
     this.publicationDate,
     String? contentUrl,
     this.author,
@@ -191,6 +200,7 @@ class Episode {
       'link': link,
       'imageUrl': imageUrl,
       'thumbImageUrl': thumbImageUrl,
+      'localImagePath': localImagePath,
       'publicationDate': publicationDate?.millisecondsSinceEpoch.toString(),
       'contentUrl': contentUrl,
       'author': author,
@@ -255,6 +265,7 @@ class Episode {
       link: episode['link'] as String?,
       imageUrl: episode['imageUrl'] as String?,
       thumbImageUrl: episode['thumbImageUrl'] as String?,
+      localImagePath: episode['localImagePath'] as String?,
       publicationDate: episode['publicationDate'] == null || episode['publicationDate'] == 'null'
           ? DateTime.now()
           : DateTime.fromMillisecondsSinceEpoch(int.parse(episode['publicationDate'] as String)),

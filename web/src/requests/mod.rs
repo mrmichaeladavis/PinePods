@@ -3,6 +3,8 @@ pub(crate) mod discover_req;
 pub(crate) mod episode;
 pub(crate) mod login_requests;
 pub(crate) mod models;
+pub(crate) mod notify;
+pub(crate) mod now_playing;
 pub(crate) mod people_req;
 pub(crate) mod pod_req;
 pub(crate) mod search_pods;

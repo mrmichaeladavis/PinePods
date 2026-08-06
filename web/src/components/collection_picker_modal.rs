@@ -137,6 +137,8 @@ pub fn collection_picker_modal() -> Html {
                     } else {
                         pod_req::call_remove_episode_from_collection(&server, &api_key, col_id, &req).await
                     };
+                    // Signal a collection page showing this collection to drop the card live.
+                    let removed_ok = !now_member && res.is_ok();
                     if let Err(e) = res {
                         Dispatch::<NotificationState>::global().reduce_mut(|s| {
                             s.error_message = Some(format!("{}", e));
@@ -155,6 +157,12 @@ pub fn collection_picker_modal() -> Html {
                                 s.saved_episodes.retain(|e| e.episodeid != ep_id);
                             });
                         }
+                    }
+                    if removed_ok {
+                        Dispatch::<CollectionModalState>::global().reduce_mut(move |s| {
+                            let nonce = s.last_removed.map(|(_, _, n)| n).unwrap_or(0).wrapping_add(1);
+                            s.last_removed = Some((ep_id, col_id, nonce));
+                        });
                     }
                 });
             })

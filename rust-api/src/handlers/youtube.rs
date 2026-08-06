@@ -6,11 +6,12 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 use std::collections::{HashMap, HashSet};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     error::AppError,
     handlers::{extract_api_key, validate_api_key},
+    services::ytdlp::ytdlp_binary,
     AppState,
 };
 
@@ -96,23 +97,28 @@ pub async fn search_youtube_channels(
     
     info!("Searching YouTube with query: {}", query.query);
     
-    // Use yt-dlp binary to search
-    let output = Command::new("yt-dlp")
+    // Use the local yt-dlp binary to search
+    let bin = ytdlp_binary();
+    let output = Command::new(&bin)
         .args(&[
             "--quiet",
             "--no-warnings",
-            "--flat-playlist", 
+            "--flat-playlist",
             "--skip-download",
             "--dump-json",
             &search_url
         ])
         .output()
         .await
-        .map_err(|e| AppError::external_error(&format!("Failed to execute yt-dlp: {}", e)))?;
+        .map_err(|e| {
+            error!("yt-dlp search: failed to execute {}: {}", bin, e);
+            AppError::external_error(&format!("Failed to execute yt-dlp: {}", e))
+        })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(AppError::external_error(&format!("yt-dlp search failed: {}", stderr)));
+        error!("yt-dlp search failed for '{}': {}", query.query, stderr.trim());
+        return Err(AppError::external_error(&format!("yt-dlp search failed: {}", stderr.trim())));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -285,38 +291,141 @@ pub async fn subscribe_to_youtube_channel(
     })))
 }
 
-// Helper function to get YouTube channel info using Backend service
-pub async fn get_youtube_channel_info(channel_id: &str) -> Result<HashMap<String, String>, AppError> {
-    info!("Getting channel info for {} from Backend service", channel_id);
-    
-    // Get Backend URL from environment variable
-    let search_api_url = std::env::var("SEARCH_API_URL")
-        .map_err(|_| AppError::external_error("SEARCH_API_URL environment variable not set"))?;
-    
-    // Replace /api/search with /api/youtube/channel for the channel details endpoint
-    let backend_url = search_api_url.replace("/api/search", &format!("/api/youtube/channel?id={}", channel_id));
-    
-    let client = reqwest::Client::new();
-    let response = client.get(&backend_url)
-        .send()
-        .await
-        .map_err(|e| AppError::external_error(&format!("Failed to call Backend service: {}", e)))?;
+// Converts yt-dlp float seconds to ISO 8601 duration (e.g. 253.0 → "PT4M13S").
+// parse_youtube_duration() below expects this format.
+fn seconds_to_pt_duration(seconds: f64) -> String {
+    let total = seconds as u64;
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    let s = total % 60;
+    if h > 0 {
+        format!("PT{}H{}M{}S", h, m, s)
+    } else if m > 0 {
+        format!("PT{}M{}S", m, s)
+    } else {
+        format!("PT{}S", s)
+    }
+}
 
-    if !response.status().is_success() {
-        return Err(AppError::external_error(&format!("Backend service error: {}", response.status())));
+// Converts yt-dlp upload_date "YYYYMMDD" to RFC3339 "YYYY-MM-DDT00:00:00Z".
+// process_youtube_channel parses publishedAt with DateTime::parse_from_rfc3339.
+fn upload_date_to_rfc3339(upload_date: &str) -> String {
+    if upload_date.len() == 8 {
+        format!("{}-{}-{}T00:00:00Z", &upload_date[..4], &upload_date[4..6], &upload_date[6..8])
+    } else {
+        chrono::Utc::now().to_rfc3339()
+    }
+}
+
+// Fetch YouTube channel metadata + recent videos by running yt-dlp locally (#793).
+// Returns the same camelCase JSON shape the hosted Backend used to return
+// ({ name, description, thumbnailUrl, recentVideos: [{ id, title, description, url,
+// thumbnail, publishedAt, duration }] }) so callers below are unchanged. This replaces the
+// old HTTP hop to SEARCH_API_URL — YouTube now resolves entirely on the local, self-updating
+// yt-dlp binary.
+async fn fetch_youtube_channel_data(channel_id: &str) -> Result<serde_json::Value, AppError> {
+    let channel_url = format!("https://www.youtube.com/channel/{}/videos", channel_id);
+    let bin = ytdlp_binary();
+    let output = Command::new(&bin)
+        .args(&[
+            "--quiet",
+            "--no-warnings",
+            "--skip-download",
+            "--dump-json",
+            "--playlist-end", "15",
+            &channel_url,
+        ])
+        .output()
+        .await
+        .map_err(|e| {
+            error!("yt-dlp channel fetch: failed to execute {} for {}: {}", bin, channel_id, e);
+            AppError::external_error(&format!("Failed to execute yt-dlp: {}", e))
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        error!("yt-dlp channel fetch failed for {}: {}", channel_id, stderr.trim());
+        return Err(AppError::external_error(&format!("yt-dlp channel fetch failed: {}", stderr.trim())));
     }
 
-    let channel_data: serde_json::Value = response.json()
-        .await
-        .map_err(|e| AppError::external_error(&format!("Failed to parse Backend response: {}", e)))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut entries: Vec<serde_json::Value> = Vec::new();
+    for line in stdout.lines() {
+        if let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) {
+            entries.push(entry);
+        }
+    }
 
-    // Extract channel info from Backend service response
+    if entries.is_empty() {
+        return Err(AppError::not_found("Channel not found or has no videos"));
+    }
+
+    let first = &entries[0];
+    let channel_name = first.get("channel").and_then(|v| v.as_str())
+        .or_else(|| first.get("uploader").and_then(|v| v.as_str()))
+        .unwrap_or("").to_string();
+    // channel_thumbnail is a URL string in full-metadata mode; fall back to first video thumbnail
+    let first_video_id = first.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    let thumbnail_url = first.get("channel_thumbnail").and_then(|v| v.as_str())
+        .or_else(|| first.get("thumbnail").and_then(|v| v.as_str()))
+        .map(|s| s.to_string())
+        .or_else(|| {
+            if !first_video_id.is_empty() {
+                Some(format!("https://i.ytimg.com/vi/{}/hqdefault.jpg", first_video_id))
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default();
+
+    let recent_videos: Vec<serde_json::Value> = entries.iter().map(|entry| {
+        let video_id = entry.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let upload_date = entry.get("upload_date").and_then(|v| v.as_str()).unwrap_or("");
+        let duration_secs = entry.get("duration").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let thumb = entry.get("thumbnail").and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .or_else(|| {
+                if !video_id.is_empty() {
+                    Some(format!("https://i.ytimg.com/vi/{}/hqdefault.jpg", video_id))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default();
+        serde_json::json!({
+            "id": video_id,
+            "title": entry.get("title").and_then(|v| v.as_str()).unwrap_or(""),
+            "description": entry.get("description").and_then(|v| v.as_str()).unwrap_or(""),
+            "url": format!("https://www.youtube.com/watch?v={}", video_id),
+            "thumbnail": thumb,
+            "publishedAt": upload_date_to_rfc3339(upload_date),
+            "duration": seconds_to_pt_duration(duration_secs),
+        })
+    }).collect();
+
+    Ok(serde_json::json!({
+        "channelId": channel_id,
+        "name": channel_name,
+        "description": "",
+        "thumbnailUrl": thumbnail_url,
+        "url": format!("https://www.youtube.com/channel/{}", channel_id),
+        "recentVideos": recent_videos,
+    }))
+}
+
+// Helper function to get YouTube channel info using the local yt-dlp binary
+pub async fn get_youtube_channel_info(channel_id: &str) -> Result<HashMap<String, String>, AppError> {
+    info!("Getting channel info for {} via local yt-dlp", channel_id);
+
+    let channel_data = fetch_youtube_channel_data(channel_id).await?;
+
+    // Extract channel info (same shape the Backend previously returned)
     let mut channel_info = HashMap::new();
-    
+
     channel_info.insert("channel_id".to_string(), channel_id.to_string());
-    channel_info.insert("name".to_string(), 
+    channel_info.insert("name".to_string(),
         channel_data.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string());
-    
+
     let description = channel_data.get("description")
         .and_then(|v| v.as_str())
         .unwrap_or("")
@@ -325,10 +434,10 @@ pub async fn get_youtube_channel_info(channel_id: &str) -> Result<HashMap<String
         .collect::<String>();
     channel_info.insert("description".to_string(), description);
 
-    channel_info.insert("thumbnail_url".to_string(), 
+    channel_info.insert("thumbnail_url".to_string(),
         channel_data.get("thumbnailUrl").and_then(|v| v.as_str()).unwrap_or("").to_string());
 
-    info!("Successfully extracted channel info for: {}", channel_info.get("name").unwrap_or(&"Unknown".to_string()));
+    info!("Successfully extracted channel info for: {}", channel_info.get("name").cloned().unwrap_or_default());
     Ok(channel_info)
 }
 
@@ -372,7 +481,7 @@ pub fn parse_youtube_duration(duration_str: &str) -> Option<i64> {
     Some(total_seconds)
 }
 
-// Process YouTube channel videos using Backend service
+// Process YouTube channel videos using the local yt-dlp binary
 pub async fn process_youtube_channel(
     podcast_id: i32,
     channel_id: &str,
@@ -388,28 +497,9 @@ pub async fn process_youtube_channel(
     debug!("Cleaning up videos older than cutoff date...");
     state.db_pool.remove_old_youtube_videos(podcast_id, cutoff_date).await?;
 
-    // Get Backend URL from environment variable
-    let search_api_url = std::env::var("SEARCH_API_URL")
-        .map_err(|_| AppError::external_error("SEARCH_API_URL environment variable not set"))?;
-    
-    // Replace /api/search with /api/youtube/channel for the channel details endpoint
-    let backend_url = search_api_url.replace("/api/search", &format!("/api/youtube/channel?id={}", channel_id));
-    debug!("Fetching channel data from Backend service: {}", backend_url);
-
-    // Get video list using Backend service
-    let client = reqwest::Client::new();
-    let response = client.get(&backend_url)
-        .send()
-        .await
-        .map_err(|e| AppError::external_error(&format!("Failed to call Backend service: {}", e)))?;
-
-    if !response.status().is_success() {
-        return Err(AppError::external_error(&format!("Backend service error: {}", response.status())));
-    }
-
-    let channel_data: serde_json::Value = response.json()
-        .await
-        .map_err(|e| AppError::external_error(&format!("Failed to parse Backend response: {}", e)))?;
+    // Fetch channel data via the local yt-dlp binary (#793)
+    debug!("Fetching channel data via local yt-dlp for {}", channel_id);
+    let channel_data = fetch_youtube_channel_data(channel_id).await?;
 
     // Self-heal: update podcast name/artwork if they were empty from a broken initial subscription
     let channel_name_update = channel_data.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -621,7 +711,8 @@ pub async fn download_youtube_audio(video_id: &str, output_path: &str) -> Result
 
     let video_url = format!("https://www.youtube.com/watch?v={}", video_id);
 
-    let output = Command::new("yt-dlp")
+    let bin = ytdlp_binary();
+    let output = Command::new(&bin)
         .args(&[
             "--format", "bestaudio/best",
             "--extract-audio",
@@ -633,11 +724,15 @@ pub async fn download_youtube_audio(video_id: &str, output_path: &str) -> Result
         ])
         .output()
         .await
-        .map_err(|e| AppError::external_error(&format!("Failed to execute yt-dlp: {}", e)))?;
+        .map_err(|e| {
+            error!("yt-dlp download: failed to execute {} for {}: {}", bin, video_id, e);
+            AppError::external_error(&format!("Failed to execute yt-dlp: {}", e))
+        })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(AppError::external_error(&format!("yt-dlp download failed: {}", stderr)));
+        error!("yt-dlp download failed for {}: {}", video_id, stderr.trim());
+        return Err(AppError::external_error(&format!("yt-dlp download failed: {}", stderr.trim())));
     }
 
     Ok(())

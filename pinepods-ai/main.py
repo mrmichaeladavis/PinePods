@@ -221,9 +221,9 @@ def transcribe(req: TranscribeRequest, x_ai_token: Optional[str] = Header(defaul
                 "model": model_name,
                 "duration": round(total, 3),
             }) + "\n"
-        except Exception:  # surface mid-stream failures to the caller (detail stays in logs)
+        except Exception as e:  # surface mid-stream failures to the caller (full traceback in logs)
             log.exception("Transcription failed for %s", path)
-            yield json.dumps({"type": "error", "error": "transcription failed"}) + "\n"
+            yield json.dumps({"type": "error", "error": f"transcription failed: {type(e).__name__}: {e}"}) + "\n"
 
     return StreamingResponse(stream(), media_type="application/x-ndjson")
 
@@ -429,9 +429,9 @@ def detect_ads(req: DetectAdsRequest, x_ai_token: Optional[str] = Header(default
             yield json.dumps({"type": "result", "segments": merged}) + "\n"
         except HTTPException as he:
             yield json.dumps({"type": "error", "error": he.detail}) + "\n"
-        except Exception:  # detail stays in logs, not the client response
+        except Exception as e:  # full traceback in logs; summary to the client
             log.exception("Ad detection failed")
-            yield json.dumps({"type": "error", "error": "ad detection failed"}) + "\n"
+            yield json.dumps({"type": "error", "error": f"ad detection failed: {type(e).__name__}: {e}"}) + "\n"
 
     return StreamingResponse(stream(), media_type="application/x-ndjson")
 
@@ -547,8 +547,8 @@ def pull_model(req: PullRequest, x_ai_token: Optional[str] = Header(default=None
 
         except HTTPException as he:
             yield json.dumps({"type": "error", "error": he.detail}) + "\n"
-        except Exception:  # detail stays in logs, not the client response
+        except Exception as e:  # full traceback in logs; summary to the client
             log.exception("Model pull failed (%s %s)", req.kind, req.model)
-            yield json.dumps({"type": "error", "error": "model pull failed"}) + "\n"
+            yield json.dumps({"type": "error", "error": f"model pull failed: {type(e).__name__}: {e}"}) + "\n"
 
     return StreamingResponse(stream(), media_type="application/x-ndjson")

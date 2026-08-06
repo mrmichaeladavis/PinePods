@@ -32,6 +32,7 @@ use utoipa::{Modify, OpenApi};
         (name = "settings", description = "User and server settings"),
         (name = "sync", description = "gpodder / Nextcloud synchronization"),
         (name = "tasks", description = "Background tasks and progress"),
+        (name = "notifications", description = "Durable in-app notifications (Activity center)"),
         (name = "feed", description = "Public RSS feed generation"),
         (name = "proxy", description = "Media and image proxying"),
         (name = "local", description = "Local podcasts and media"),

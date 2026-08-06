@@ -44,6 +44,9 @@ pub fn ai_settings() -> Html {
     let pull_repo = use_state(String::new);
     let pull_filename = use_state(String::new);
 
+    // Job-queue modal open/close.
+    let queue_open = use_state(|| false);
+
     {
         let ai_status = ai_status.clone();
         let checked = checked.clone();
@@ -89,9 +92,13 @@ pub fn ai_settings() -> Html {
             ("var(--text-secondary-color)", i18n.t("ai_settings.not_configured"))
         };
         html! {
-            <div class="flex items-center justify-between py-1 text-sm">
-                <span class="item_container-text">{ label }</span>
-                <span style={format!("color:{};font-weight:500;", color)}>{ text }</span>
+            <div class="settings-row">
+                <div>
+                    <div class="settings-row-label">{ label }</div>
+                </div>
+                <div class="settings-row-control">
+                    <span style={format!("color:{};font-weight:500;", color)}>{ text }</span>
+                </div>
             </div>
         }
     };
@@ -204,53 +211,127 @@ pub fn ai_settings() -> Html {
         .into_iter()
         .filter(|t| matches!(t.r#type.as_str(), "transcribe_episode" | "detect_ads" | "pull_model"))
         .collect();
+    let ai_count = ai_tasks.len();
+
+    // Job-queue modal open/close handlers.
+    let open_queue = {
+        let queue_open = queue_open.clone();
+        Callback::from(move |_: MouseEvent| queue_open.set(true))
+    };
+    let close_queue = {
+        let queue_open = queue_open.clone();
+        Callback::from(move |_: MouseEvent| queue_open.set(false))
+    };
+    let stop = Callback::from(|e: MouseEvent| e.stop_propagation());
+
+    // The list of job rows shared by the modal body (empty-state handled by caller).
+    let job_rows: Html = ai_tasks
+        .iter()
+        .map(|t| {
+            let label = t.item_id.clone().unwrap_or_else(|| t.task_id.clone());
+            // task.progress is already a 0–100 percentage.
+            let pct = t.progress.round().clamp(0.0, 100.0) as i32;
+            let kind = match t.r#type.as_str() {
+                "detect_ads" => i18n.t("ai_settings.job_ads"),
+                "pull_model" => i18n.t("ai_settings.job_pull"),
+                _ => i18n.t("ai_settings.job_transcribe"),
+            };
+            let failed = t.status.as_str() == "FAILED";
+            // Prefer the operation message (e.g. "Transcribing…" or the failure detail) from
+            // details; the raw `status` enum is download-centric ("DOWNLOADING").
+            let status_label = t
+                .details
+                .as_ref()
+                .and_then(|d| d.get("status_text").cloned())
+                .unwrap_or_else(|| match t.status.as_str() {
+                    "SUCCESS" => i18n.t("ai_settings.done").to_string(),
+                    "FAILED" => i18n.t("ai_settings.failed").to_string(),
+                    _ => i18n.t("ai_settings.running").to_string(),
+                });
+            let status_color = if failed {
+                "var(--error-color)"
+            } else {
+                "var(--text-secondary-color)"
+            };
+            html! {
+                <li class="ai-queue-item" style="padding:8px 0;border-bottom:1px solid rgba(255,255,255,.06);">
+                    <div class="flex items-center justify-between text-sm">
+                        <span class="settings-row-label" style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{ format!("{} {}", kind, label) }</span>
+                        <span style={format!("color:{};font-weight:500;white-space:nowrap;margin-left:12px;", status_color)}>{ format!("{}%", pct) }</span>
+                    </div>
+                    <div style={format!("font-size:12px;color:{};margin-top:2px;word-break:break-word;", status_color)}>{ status_label }</div>
+                    if !failed {
+                        <div style="height:4px;border-radius:var(--radius-full);background:var(--unfilled-color);margin-top:6px;overflow:hidden;">
+                            <div style={format!("height:100%;width:{}%;background:var(--accent-color);transition:width var(--dur-base);", pct)}></div>
+                        </div>
+                    }
+                </li>
+            }
+        })
+        .collect::<Html>();
 
     let backend = (*llm_backend).clone();
     let whisper_opts = models.whisper.clone();
     let local_opts = models.llm_local.clone();
 
     html! {
-        <div class="transcription-settings">
-            <div class="mb-3">
-                <span class="text-sm font-medium" style="color:var(--text-color);">{ i18n.t("ai_settings.ai_service") }{" "}</span>
-                { connection_badge }
+        <>
+            // ---- Service status ----
+            <div class="settings-row">
+                <div>
+                    <div class="settings-row-label">{ i18n.t("ai_settings.ai_service") }</div>
+                    <div class="settings-row-desc">{ i18n.t("ai_settings.intro") }</div>
+                </div>
+                <div class="settings-row-control">{ connection_badge }</div>
             </div>
-            <p class="item_container-text text-sm mb-3">{ i18n.t("ai_settings.intro") }</p>
 
-            <div class="settings-section-title mt-3 mb-1">{ i18n.t("ai_settings.capabilities") }</div>
+            <div class="settings-section-subhead">{ i18n.t("ai_settings.capabilities") }</div>
             { capability_row(i18n.t("ai_settings.transcription").to_string(), ai_status.transcription_ready) }
             { capability_row(i18n.t("ai_settings.ad_removal").to_string(), ai_status.ad_removal_ready) }
-
-            {
-                // Ad removal has no default model — tell the admin how to enable it.
-                if *is_admin && ai_status.available && !ai_status.ad_removal_ready {
-                    html! {
-                        <p class="item_container-text text-sm mt-2 mb-1" style="color:var(--text-secondary-color);">
-                            { i18n.t("ai_settings.ad_removal_hint") }
-                        </p>
-                    }
-                } else { html! {} }
-            }
 
             {
                 if *is_admin {
                     html! {
                         <>
-                            <div class="settings-section-title mt-4 mb-2">{ i18n.t("ai_settings.models") }</div>
+                            // ---- Transcription ----
+                            <div class="settings-section-subhead">{ i18n.t("ai_settings.transcription") }</div>
+                            <div class="settings-row">
+                                <div>
+                                    <div class="settings-row-label">{ i18n.t("ai_settings.transcription_model") }</div>
+                                </div>
+                                <div class="settings-row-control">
+                                    <select class="select" style="width:280px;max-width:60vw;"
+                                        onchange={set_from_select(transcription_model.clone())} value={(*transcription_model).clone()}>
+                                        { for whisper_opts.iter().map(|m| html!{ <option value={m.clone()} selected={*transcription_model == *m}>{ m.clone() }</option> }) }
+                                    </select>
+                                </div>
+                            </div>
 
-                            // Transcription (whisper) model
-                            <label class="block mb-1 text-sm font-medium" style="color:var(--text-color);">{ i18n.t("ai_settings.transcription_model") }</label>
-                            <select class="email-select mb-3" onchange={set_from_select(transcription_model.clone())} value={(*transcription_model).clone()}>
-                                { for whisper_opts.iter().map(|m| html!{ <option value={m.clone()} selected={*transcription_model == *m}>{ m.clone() }</option> }) }
-                            </select>
-
-                            // LLM backend (ad detection)
-                            <label class="block mb-1 text-sm font-medium" style="color:var(--text-color);">{ i18n.t("ai_settings.llm_backend") }</label>
-                            <select class="email-select mb-3" onchange={set_from_select(llm_backend.clone())} value={backend.clone()}>
-                                <option value="local" selected={backend == "local"}>{ i18n.t("ai_settings.backend_local") }</option>
-                                <option value="remote" selected={backend == "remote"}>{ i18n.t("ai_settings.backend_remote") }</option>
-                                <option value="anthropic" selected={backend == "anthropic"}>{ i18n.t("ai_settings.backend_anthropic") }</option>
-                            </select>
+                            // ---- Ad detection ----
+                            <div class="settings-section-subhead">{ i18n.t("ai_settings.section_ad_detection") }</div>
+                            {
+                                // Ad removal has no default model — tell the admin how to enable it.
+                                if ai_status.available && !ai_status.ad_removal_ready {
+                                    html! {
+                                        <div class="settings-row">
+                                            <div><div class="settings-row-desc">{ i18n.t("ai_settings.ad_removal_hint") }</div></div>
+                                        </div>
+                                    }
+                                } else { html! {} }
+                            }
+                            <div class="settings-row">
+                                <div>
+                                    <div class="settings-row-label">{ i18n.t("ai_settings.llm_backend") }</div>
+                                </div>
+                                <div class="settings-row-control">
+                                    <select class="select" style="width:280px;max-width:60vw;"
+                                        onchange={set_from_select(llm_backend.clone())} value={backend.clone()}>
+                                        <option value="local" selected={backend == "local"}>{ i18n.t("ai_settings.backend_local") }</option>
+                                        <option value="remote" selected={backend == "remote"}>{ i18n.t("ai_settings.backend_remote") }</option>
+                                        <option value="anthropic" selected={backend == "anthropic"}>{ i18n.t("ai_settings.backend_anthropic") }</option>
+                                    </select>
+                                </div>
+                            </div>
 
                             {
                                 if backend == "remote" || backend == "anthropic" {
@@ -261,100 +342,137 @@ pub fn ai_settings() -> Html {
                                     };
                                     html! {
                                         <>
-                                            <label class="block mb-1 text-sm font-medium" style="color:var(--text-color);">{ i18n.t("ai_settings.llm_url") }</label>
-                                            <input type="text" class="email-input mb-3" placeholder={url_ph}
-                                                value={(*llm_url).clone()} oninput={set_from_input(llm_url.clone())} />
-                                            <label class="block mb-1 text-sm font-medium" style="color:var(--text-color);">{ i18n.t("ai_settings.llm_model_name") }</label>
-                                            <input type="text" class="email-input mb-3" placeholder={model_ph}
-                                                value={(*llm_model).clone()} oninput={set_from_input(llm_model.clone())} />
-                                            <label class="block mb-1 text-sm font-medium" style="color:var(--text-color);">{ i18n.t("ai_settings.llm_api_key") }</label>
-                                            <input type="password" class="email-input mb-3"
-                                                placeholder={ if *has_api_key { i18n.t("ai_settings.api_key_set").to_string() } else { String::new() } }
-                                                value={(*llm_api_key).clone()} oninput={set_from_input(llm_api_key.clone())} />
+                                            <div class="settings-row">
+                                                <div><div class="settings-row-label">{ i18n.t("ai_settings.llm_url") }</div></div>
+                                                <div class="settings-row-control">
+                                                    <input type="text" class="input" style="width:280px;max-width:60vw;" placeholder={url_ph}
+                                                        value={(*llm_url).clone()} oninput={set_from_input(llm_url.clone())} />
+                                                </div>
+                                            </div>
+                                            <div class="settings-row">
+                                                <div><div class="settings-row-label">{ i18n.t("ai_settings.llm_model_name") }</div></div>
+                                                <div class="settings-row-control">
+                                                    <input type="text" class="input" style="width:280px;max-width:60vw;" placeholder={model_ph}
+                                                        value={(*llm_model).clone()} oninput={set_from_input(llm_model.clone())} />
+                                                </div>
+                                            </div>
+                                            <div class="settings-row">
+                                                <div><div class="settings-row-label">{ i18n.t("ai_settings.llm_api_key") }</div></div>
+                                                <div class="settings-row-control">
+                                                    <input type="password" class="input" style="width:280px;max-width:60vw;"
+                                                        placeholder={ if *has_api_key { i18n.t("ai_settings.api_key_set").to_string() } else { String::new() } }
+                                                        value={(*llm_api_key).clone()} oninput={set_from_input(llm_api_key.clone())} />
+                                                </div>
+                                            </div>
                                         </>
                                     }
                                 } else {
                                     html! {
-                                        <>
-                                            <label class="block mb-1 text-sm font-medium" style="color:var(--text-color);">{ i18n.t("ai_settings.llm_local_model") }</label>
-                                            <select class="email-select mb-3" onchange={set_from_select(llm_model.clone())} value={(*llm_model).clone()}>
-                                                <option value="" selected={(*llm_model).is_empty()}>{ i18n.t("ai_settings.select_model") }</option>
-                                                { for local_opts.iter().map(|m| html!{ <option value={m.clone()} selected={*llm_model == *m}>{ m.clone() }</option> }) }
-                                            </select>
-                                        </>
+                                        <div class="settings-row">
+                                            <div><div class="settings-row-label">{ i18n.t("ai_settings.llm_local_model") }</div></div>
+                                            <div class="settings-row-control">
+                                                <select class="select" style="width:280px;max-width:60vw;"
+                                                    onchange={set_from_select(llm_model.clone())} value={(*llm_model).clone()}>
+                                                    <option value="" selected={(*llm_model).is_empty()}>{ i18n.t("ai_settings.select_model") }</option>
+                                                    { for local_opts.iter().map(|m| html!{ <option value={m.clone()} selected={*llm_model == *m}>{ m.clone() }</option> }) }
+                                                </select>
+                                            </div>
+                                        </div>
                                     }
                                 }
                             }
 
-                            <button class="download-button mb-4" onclick={on_save} disabled={*saving}>
-                                { if *saving { i18n.t("ai_settings.saving") } else { i18n.t("ai_settings.save") } }
-                            </button>
+                            <div class="settings-row">
+                                <div></div>
+                                <div class="settings-row-control">
+                                    <button class="btn btn-primary" onclick={on_save} disabled={*saving}>
+                                        <i class="ph ph-floppy-disk"></i>
+                                        <span>{ if *saving { i18n.t("ai_settings.saving") } else { i18n.t("ai_settings.save") } }</span>
+                                    </button>
+                                </div>
+                            </div>
 
-                            // Pull a new model
-                            <div class="settings-section-title mt-2 mb-2">{ i18n.t("ai_settings.pull_model") }</div>
-                            <div class="flex flex-wrap gap-2 items-end mb-3">
-                                <select class="email-select" onchange={set_from_select(pull_kind.clone())} value={(*pull_kind).clone()}>
-                                    <option value="gguf" selected={*pull_kind == "gguf"}>{ "GGUF (Hugging Face)" }</option>
-                                    <option value="whisper" selected={*pull_kind == "whisper"}>{ "Whisper" }</option>
-                                    <option value="ollama" selected={*pull_kind == "ollama"}>{ "Ollama" }</option>
-                                </select>
-                                {
-                                    if *pull_kind == "gguf" {
-                                        html! {
-                                            <>
-                                                <input type="text" class="email-input" placeholder={i18n.t("ai_settings.hf_repo").to_string()} value={(*pull_repo).clone()} oninput={set_from_input(pull_repo.clone())} />
-                                                <input type="text" class="email-input" placeholder={i18n.t("ai_settings.hf_filename").to_string()} value={(*pull_filename).clone()} oninput={set_from_input(pull_filename.clone())} />
-                                            </>
-                                        }
-                                    } else {
-                                        html! {
-                                            <input type="text" class="email-input" placeholder={i18n.t("ai_settings.model_name").to_string()} value={(*pull_model).clone()} oninput={set_from_input(pull_model.clone())} />
+                            // ---- Pull a model ----
+                            <div class="settings-section-subhead">{ i18n.t("ai_settings.pull_model") }</div>
+                            <div class="settings-row">
+                                <div>
+                                    <div class="settings-row-label">{ i18n.t("ai_settings.pull_model") }</div>
+                                </div>
+                                <div class="settings-row-control" style="flex-wrap:wrap;">
+                                    <select class="select" style="width:200px;" onchange={set_from_select(pull_kind.clone())} value={(*pull_kind).clone()}>
+                                        <option value="gguf" selected={*pull_kind == "gguf"}>{ "GGUF (Hugging Face)" }</option>
+                                        <option value="whisper" selected={*pull_kind == "whisper"}>{ "Whisper" }</option>
+                                        <option value="ollama" selected={*pull_kind == "ollama"}>{ "Ollama" }</option>
+                                    </select>
+                                    {
+                                        if *pull_kind == "gguf" {
+                                            html! {
+                                                <>
+                                                    <input type="text" class="input" style="width:200px;" placeholder={i18n.t("ai_settings.hf_repo").to_string()} value={(*pull_repo).clone()} oninput={set_from_input(pull_repo.clone())} />
+                                                    <input type="text" class="input" style="width:200px;" placeholder={i18n.t("ai_settings.hf_filename").to_string()} value={(*pull_filename).clone()} oninput={set_from_input(pull_filename.clone())} />
+                                                </>
+                                            }
+                                        } else {
+                                            html! {
+                                                <input type="text" class="input" style="width:200px;" placeholder={i18n.t("ai_settings.model_name").to_string()} value={(*pull_model).clone()} oninput={set_from_input(pull_model.clone())} />
+                                            }
                                         }
                                     }
-                                }
-                                <button class="download-button" onclick={on_pull}>{ i18n.t("ai_settings.pull") }</button>
+                                    <button class="btn btn-primary" onclick={on_pull}>
+                                        <i class="ph ph-download-simple"></i>
+                                        <span>{ i18n.t("ai_settings.pull") }</span>
+                                    </button>
+                                </div>
                             </div>
                         </>
                     }
                 } else { html! {} }
             }
 
-            <div class="settings-section-title mt-4 mb-2">{ i18n.t("ai_settings.queue") }</div>
+            // ---- Job queue (opens in a modal) ----
+            <div class="settings-section-subhead">{ i18n.t("ai_settings.queue") }</div>
+            <div class="settings-row">
+                <div>
+                    <div class="settings-row-desc">
+                        { if ai_count == 0 { i18n.t("ai_settings.no_active_jobs") } else { i18n.t("ai_settings.queue") } }
+                    </div>
+                </div>
+                <div class="settings-row-control">
+                    <button class="btn btn-secondary" onclick={open_queue}>
+                        <i class="ph ph-list-checks"></i>
+                        <span>{ format!("{} ({})", i18n.t("ai_settings.view_queue"), ai_count) }</span>
+                    </button>
+                </div>
+            </div>
+
             {
-                if ai_tasks.is_empty() {
-                    html! { <p class="item_container-text text-sm" style="color:var(--text-secondary-color);">{ i18n.t("ai_settings.no_active_jobs") }</p> }
-                } else {
+                if *queue_open {
                     html! {
-                        <ul class="transcription-queue">
-                            { for ai_tasks.iter().map(|t| {
-                                let label = t.item_id.clone().unwrap_or_else(|| t.task_id.clone());
-                                // task.progress is already a 0–100 percentage.
-                                let pct = t.progress.round().clamp(0.0, 100.0) as i32;
-                                let kind = match t.r#type.as_str() {
-                                    "detect_ads" => i18n.t("ai_settings.job_ads"),
-                                    "pull_model" => i18n.t("ai_settings.job_pull"),
-                                    _ => i18n.t("ai_settings.job_transcribe"),
-                                };
-                                // Prefer the operation message (e.g. "Transcribing…") from details;
-                                // the raw `status` enum is download-centric ("DOWNLOADING").
-                                let status_label = t.details.as_ref()
-                                    .and_then(|d| d.get("status_text").cloned())
-                                    .unwrap_or_else(|| match t.status.as_str() {
-                                        "SUCCESS" => i18n.t("ai_settings.done").to_string(),
-                                        "FAILED" => i18n.t("ai_settings.failed").to_string(),
-                                        _ => i18n.t("ai_settings.running").to_string(),
-                                    });
-                                html! {
-                                    <li class="flex items-center justify-between py-1 text-sm">
-                                        <span class="item_container-text">{ format!("{} {}", kind, label) }</span>
-                                        <span style="color:var(--text-secondary-color);">{ format!("{} — {}%", status_label, pct) }</span>
-                                    </li>
-                                }
-                            }) }
-                        </ul>
+                        <div class="fixed inset-0 z-50 overflow-y-auto bg-black bg-opacity-25" onclick={close_queue.clone()}>
+                            <div class="flex min-h-full items-center justify-center p-4">
+                                <div class="modal-container relative w-full max-w-md rounded-lg shadow" onclick={stop}>
+                                    <div class="flex items-center justify-between p-4 md:p-5 border-b rounded-t">
+                                        <h3 class="text-xl font-semibold">{ i18n.t("ai_settings.queue") }</h3>
+                                        <button onclick={close_queue.clone()} aria-label={i18n.t("common.close_modal")}
+                                            class="text-gray-400 bg-transparent rounded-lg text-sm w-8 h-8 inline-flex justify-center items-center">
+                                            <i class="ph ph-x text-xl"></i>
+                                        </button>
+                                    </div>
+                                    <div class="p-4 md:p-5">
+                                        {
+                                            if ai_count == 0 {
+                                                html! { <p class="settings-row-desc">{ i18n.t("ai_settings.no_active_jobs") }</p> }
+                                            } else {
+                                                html! { <ul class="max-h-[60vh] overflow-y-auto" style="list-style:none;margin:0;padding:0;">{ job_rows }</ul> }
+                                            }
+                                        }
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
                     }
-                }
+                } else { html! {} }
             }
-        </div>
+        </>
     }
 }

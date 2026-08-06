@@ -1,23 +1,27 @@
 // notification_center.rs
-use crate::components::context::{AppState, NotificationState};
+//
+// The Activity center: a right-edge drawer (Direction 2 "Status cards", compact
+// density) that shows ongoing background TASKS and durable server MESSAGES under
+// All / Active / Done tabs. Completed tasks move to "Done" and stay until the
+// user clears them (the old 30s auto-yank is gone). Transient toasts for
+// client-initiated actions live in `ToastNotification` below.
+use crate::components::context::{AppState, NotificationMessage, NotificationState};
+use crate::pages::routes::Route;
 use crate::requests::pod_req::RefreshProgress;
-use crate::requests::task_reqs::init_task_monitoring;
+use crate::requests::task_reqs::{init_task_monitoring, parse_rfc3339_ms};
 use gloo_timers::callback::Interval;
 use gloo_timers::callback::Timeout;
 use i18nrs::yew::use_translation;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use wasm_bindgen::closure::Closure;
+use std::collections::{HashMap, HashSet};
 use wasm_bindgen::prelude::wasm_bindgen;
-use wasm_bindgen::JsCast;
-use web_sys::{window, Event, MouseEvent};
+use wasm_bindgen_futures::spawn_local;
+use web_sys::MouseEvent;
 use yew::prelude::*;
+use yew_router::prelude::*;
 use yewdux::prelude::*;
 
-// Task progress state that will be stored in AppState
-// In notification_center.rs, update the TaskProgress struct:
-
-// Task progress state that will be stored in AppState
+// Task progress state stored in NotificationState.
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct TaskProgress {
     pub task_id: String,
@@ -30,7 +34,18 @@ pub struct TaskProgress {
     pub completed_at: Option<String>,
     pub details: Option<HashMap<String, String>>,
     #[serde(default)]
-    pub completion_time: Option<f64>, // JS timestamp for auto-cleanup
+    pub completion_time: Option<f64>, // JS timestamp used for relative-time labels
+    // ---- Direction-2 activity-center enrichment (mirrors backend TaskInfo/TaskUpdate) ----
+    #[serde(default)]
+    pub art_url: Option<String>,
+    #[serde(default)]
+    pub detail: Option<String>,
+    #[serde(default)]
+    pub group: Option<String>,
+    #[serde(default)]
+    pub group_label: Option<String>,
+    #[serde(default)]
+    pub total: Option<i32>,
 }
 
 impl TaskProgress {
@@ -44,8 +59,8 @@ impl TaskProgress {
         };
 
         Self {
-            task_id: format!("feed_refresh_{}", js_sys::Date::now()), // Generate a unique ID
-            user_id: 0, // We'll use the user ID from the state later
+            task_id: format!("feed_refresh_{}", js_sys::Date::now()),
+            user_id: 0,
             item_id: None,
             r#type: "feed_refresh".to_string(),
             progress: progress_percentage,
@@ -63,77 +78,283 @@ impl TaskProgress {
                 details
             }),
             completion_time: None,
+            art_url: None,
+            detail: None,
+            group: None,
+            group_label: None,
+            total: None,
         }
     }
+
+    /// The card sub-line: explicit `detail`, else `details.status_text`.
+    fn sub_line(&self) -> Option<String> {
+        if let Some(d) = &self.detail {
+            if !d.is_empty() {
+                return Some(d.clone());
+            }
+        }
+        self.details
+            .as_ref()
+            .and_then(|d| d.get("status_text"))
+            .filter(|s| !s.is_empty())
+            .cloned()
+    }
+}
+
+// ===================== classification helpers =====================
+
+fn is_progress(status: &str) -> bool {
+    matches!(
+        status,
+        "PROGRESS" | "STARTED" | "DOWNLOADING" | "PROCESSING" | "FINALIZING"
+    )
+}
+fn is_active(status: &str) -> bool {
+    status == "PENDING" || is_progress(status)
+}
+fn is_done(status: &str) -> bool {
+    status == "SUCCESS" || status == "FAILED"
+}
+/// Semantic kind driving color (`k-*` CSS classes).
+fn kind_class(status: &str) -> &'static str {
+    match status {
+        "PENDING" => "queued",
+        "SUCCESS" => "success",
+        "FAILED" => "failed",
+        _ => "active",
+    }
+}
+/// Sort rank: active first, then queued, failed, success.
+fn rank(status: &str) -> u8 {
+    if is_progress(status) {
+        0
+    } else if status == "PENDING" {
+        1
+    } else if status == "FAILED" {
+        2
+    } else {
+        3
+    }
+}
+fn task_icon(task_type: &str) -> &'static str {
+    match task_type {
+        "download_episode" | "podcast_download" | "bulk_download" | "download_all_episodes" => {
+            "ph-download-simple"
+        }
+        "feed_refresh" => "ph-arrows-clockwise",
+        "youtube_download" | "download_video" | "download_all_videos" => "ph-youtube-logo",
+        "playlist_generation" | "update_playlists" => "ph-list-checks",
+        "opml_import" | "add_podcast_episodes" => "ph-upload-simple",
+        "refresh_gpodder_subscriptions" | "gpodder_subscription_refresh" => "ph-arrows-left-right",
+        "refresh_nextcloud_subscriptions" | "nextcloud_auth" => "ph-cloud",
+        "manual_backup_to_directory" => "ph-floppy-disk",
+        "restore_from_backup_file" => "ph-clock-counter-clockwise",
+        "cleanup_tasks" => "ph-broom",
+        "refresh_hosts" => "ph-users",
+        _ => "ph-circle",
+    }
+}
+/// Message severity → (kind class, icon).
+fn msg_kind(severity: &str) -> (&'static str, &'static str) {
+    match severity {
+        "error" => ("error", "ph-warning-circle"),
+        "warning" => ("error", "ph-warning"),
+        "success" => ("success", "ph-check-circle"),
+        _ => ("info", "ph-info"),
+    }
+}
+fn msg_counts_badge(severity: &str) -> bool {
+    severity == "error" || severity == "warning"
+}
+/// Relative time label from a JS epoch-ms timestamp.
+fn rel_time(ts: f64) -> String {
+    let secs = (js_sys::Date::now() - ts) / 1000.0;
+    if secs < 45.0 {
+        return "just now".to_string();
+    }
+    let mins = (secs / 60.0).round();
+    if mins < 60.0 {
+        return format!("{}m ago", mins as i64);
+    }
+    let hours = (mins / 60.0).round();
+    if hours < 24.0 {
+        return format!("{}h ago", hours as i64);
+    }
+    format!("{}d ago", (hours / 24.0).round() as i64)
+}
+
+// A group of sibling tasks folded into one collapsible summary row.
+struct GroupNode {
+    key: String,
+    label: String,
+    ttype: String,
+    art: Option<String>,
+    children: Vec<TaskProgress>,
+    done_count: usize,
+    active_count: usize,
+    progress: f64,
+    all_done: bool,
+    any_failed: bool,
+    count: i32,
+}
+
+enum RenderNode {
+    Task(TaskProgress),
+    Group(GroupNode),
+}
+
+/// Fold tasks sharing a `group` key into synthetic group nodes; ungrouped tasks
+/// pass through. Input should already be sorted.
+fn group_tasks(tasks: Vec<TaskProgress>) -> Vec<RenderNode> {
+    let mut out: Vec<RenderNode> = Vec::new();
+    let mut index: HashMap<String, usize> = HashMap::new();
+
+    for task in tasks {
+        match task.group.clone() {
+            None => out.push(RenderNode::Task(task)),
+            Some(key) => {
+                if let Some(&i) = index.get(&key) {
+                    if let RenderNode::Group(node) = &mut out[i] {
+                        node.children.push(task);
+                    }
+                } else {
+                    index.insert(key.clone(), out.len());
+                    out.push(RenderNode::Group(GroupNode {
+                        label: task.group_label.clone().unwrap_or_else(|| "Tasks".to_string()),
+                        ttype: task.r#type.clone(),
+                        art: task.art_url.clone(),
+                        count: task.total.unwrap_or(0),
+                        key,
+                        children: vec![task],
+                        done_count: 0,
+                        active_count: 0,
+                        progress: 0.0,
+                        all_done: false,
+                        any_failed: false,
+                    }));
+                }
+            }
+        }
+    }
+
+    for node in out.iter_mut() {
+        if let RenderNode::Group(g) = node {
+            let ch = &g.children;
+            g.done_count = ch.iter().filter(|t| is_done(&t.status)).count();
+            g.active_count = ch.iter().filter(|t| is_active(&t.status)).count();
+            g.progress = if ch.is_empty() {
+                0.0
+            } else {
+                ch.iter().map(|t| t.progress).sum::<f64>() / ch.len() as f64
+            };
+            g.all_done = ch.iter().all(|t| is_done(&t.status));
+            g.any_failed = ch.iter().any(|t| t.status == "FAILED");
+            if g.count <= 0 {
+                g.count = ch.len() as i32;
+            }
+        }
+    }
+    out
+}
+
+fn sort_tasks(mut tasks: Vec<TaskProgress>) -> Vec<TaskProgress> {
+    tasks.sort_by(|a, b| {
+        rank(&a.status).cmp(&rank(&b.status)).then_with(|| {
+            b.completion_time
+                .unwrap_or(0.0)
+                .partial_cmp(&a.completion_time.unwrap_or(0.0))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    });
+    tasks
 }
 
 #[function_component(NotificationCenter)]
 pub fn notification_center() -> Html {
     let (i18n, _) = use_translation();
 
-    // Pre-capture translation strings
-    let i18n_notifications = i18n.t("notification_center.notifications").to_string();
-    let i18n_hide_completed = i18n.t("notification_center.hide_completed").to_string();
-    let i18n_show_completed = i18n.t("notification_center.show_completed").to_string();
-    let i18n_clear_all = i18n
-        .t("notification_center.clear_all_notifications")
+    // Task type + status labels (reuse existing i18n keys).
+    let l_download = i18n.t("notification_center.task_download").to_string();
+    let l_feed_refresh = i18n.t("notification_center.task_feed_refresh").to_string();
+    let l_playlist = i18n.t("notification_center.task_playlist").to_string();
+    let l_youtube = i18n.t("notification_center.task_youtube_download").to_string();
+    let l_bulk = i18n.t("notification_center.task_bulk_download").to_string();
+    let l_youtube_bulk = i18n
+        .t("notification_center.task_youtube_bulk_download")
         .to_string();
-    let i18n_dismiss_completed = i18n.t("notification_center.dismiss_completed").to_string();
-    let i18n_all_tasks = i18n.t("notification_center.all_tasks").to_string();
-    let i18n_active_tasks = i18n.t("notification_center.active_tasks").to_string();
-    let i18n_dismiss_all_completed = i18n
-        .t("notification_center.dismiss_all_completed_tasks")
-        .to_string();
-    let i18n_dismiss_notification = i18n
-        .t("notification_center.dismiss_notification")
-        .to_string();
-    let i18n_dismiss_error = i18n.t("notification_center.dismiss_error").to_string();
-    let i18n_dismiss_message = i18n.t("notification_center.dismiss_message").to_string();
-    let i18n_no_notifications = i18n.t("notification_center.no_notifications").to_string();
+    let l_opml = i18n.t("notification_center.task_opml_import").to_string();
+    let l_add_podcast = i18n.t("notification_center.task_add_podcast").to_string();
+    let l_backup = i18n.t("notification_center.task_backup").to_string();
+    let l_restore = i18n.t("notification_center.task_restore").to_string();
+    let l_gpodder = i18n.t("notification_center.task_gpodder_sync").to_string();
+    let l_nextcloud = i18n.t("notification_center.task_nextcloud_sync").to_string();
+    let l_nextcloud_auth = i18n.t("notification_center.task_nextcloud_auth").to_string();
+    let l_playlist_update = i18n.t("notification_center.task_playlist_update").to_string();
+    let l_cleanup = i18n.t("notification_center.task_cleanup").to_string();
+    let l_refresh_hosts = i18n.t("notification_center.task_refresh_hosts").to_string();
 
-    // Status translations
-    let i18n_queued = i18n.t("notification_center.status_queued").to_string();
-    let i18n_in_progress = i18n.t("notification_center.status_in_progress").to_string();
-    let i18n_downloading = i18n.t("notification_center.status_downloading").to_string();
-    let i18n_processing = i18n.t("notification_center.status_processing").to_string();
-    let i18n_finalizing = i18n.t("notification_center.status_finalizing").to_string();
-    let i18n_completed = i18n.t("notification_center.status_completed").to_string();
-    let i18n_failed = i18n.t("notification_center.status_failed").to_string();
+    let s_queued = i18n.t("notification_center.status_queued").to_string();
+    let s_in_progress = i18n.t("notification_center.status_in_progress").to_string();
+    let s_completed = i18n.t("notification_center.status_completed").to_string();
+    let s_failed = i18n.t("notification_center.status_failed").to_string();
 
-    // Task type translations
-    let i18n_download = i18n.t("notification_center.task_download").to_string();
-    let i18n_feed_refresh = i18n.t("notification_center.task_feed_refresh").to_string();
-    let i18n_playlist = i18n.t("notification_center.task_playlist").to_string();
-    let i18n_youtube_download = i18n
-        .t("notification_center.task_youtube_download")
-        .to_string();
-    let i18n_bulk_download = i18n.t("notification_center.task_bulk_download").to_string();
-    let i18n_youtube_bulk_download = i18n.t("notification_center.task_youtube_bulk_download").to_string();
-    let i18n_opml_import = i18n.t("notification_center.task_opml_import").to_string();
-    let i18n_add_podcast = i18n.t("notification_center.task_add_podcast").to_string();
-    let i18n_backup = i18n.t("notification_center.task_backup").to_string();
-    let i18n_restore = i18n.t("notification_center.task_restore").to_string();
-    let i18n_gpodder_sync = i18n.t("notification_center.task_gpodder_sync").to_string();
-    let i18n_nextcloud_sync = i18n.t("notification_center.task_nextcloud_sync").to_string();
-    let i18n_nextcloud_auth = i18n.t("notification_center.task_nextcloud_auth").to_string();
-    let i18n_playlist_update = i18n.t("notification_center.task_playlist_update").to_string();
-    let i18n_cleanup = i18n.t("notification_center.task_cleanup").to_string();
-    let i18n_refresh_hosts = i18n.t("notification_center.task_refresh_hosts").to_string();
-    let i18n_episode = i18n.t("notification_center.item_episode").to_string();
-    let i18n_youtube_video = i18n.t("notification_center.item_youtube_video").to_string();
-    let i18n_item = i18n.t("notification_center.item_generic").to_string();
+    let type_label = {
+        move |t: &str| -> String {
+            match t {
+                "download_episode" | "podcast_download" => l_download.clone(),
+                "bulk_download" | "download_all_episodes" => l_bulk.clone(),
+                "feed_refresh" => l_feed_refresh.clone(),
+                "youtube_download" | "download_video" => l_youtube.clone(),
+                "download_all_videos" => l_youtube_bulk.clone(),
+                "playlist_generation" => l_playlist.clone(),
+                "update_playlists" => l_playlist_update.clone(),
+                "opml_import" => l_opml.clone(),
+                "add_podcast_episodes" => l_add_podcast.clone(),
+                "manual_backup_to_directory" => l_backup.clone(),
+                "restore_from_backup_file" => l_restore.clone(),
+                "refresh_gpodder_subscriptions" | "gpodder_subscription_refresh" => l_gpodder.clone(),
+                "refresh_nextcloud_subscriptions" => l_nextcloud.clone(),
+                "nextcloud_auth" => l_nextcloud_auth.clone(),
+                "cleanup_tasks" => l_cleanup.clone(),
+                "refresh_hosts" => l_refresh_hosts.clone(),
+                other => other.to_string(),
+            }
+        }
+    };
+    let status_label = {
+        move |status: &str| -> String {
+            match kind_class(status) {
+                "queued" => s_queued.clone(),
+                "success" => s_completed.clone(),
+                "failed" => s_failed.clone(),
+                _ => s_in_progress.clone(),
+            }
+        }
+    };
 
     let (state, dispatch) = use_store::<NotificationState>();
-    let dropdown_open = use_state(|| false);
-    let notification_count = use_state(|| 0);
-    let ws_initialized = use_state(|| false);
-    let show_completed = use_state(|| true); // State to toggle showing completed tasks
+    let (app_state_store, _) = use_store::<AppState>();
+    let navigator = use_navigator();
 
-    // Initialize WebSocket connection on component mount
+    let drawer_open = use_state(|| false);
+    let tab = use_state(|| "all".to_string());
+    let expanded = use_state(HashSet::<String>::new);
+    let ws_initialized = use_state(|| false);
+
+    // Credentials for server-side notification management.
+    let creds: Option<(i32, String, String)> =
+        match (&app_state_store.user_details, &app_state_store.auth_details) {
+            (Some(ud), Some(ad)) => ad
+                .api_key
+                .clone()
+                .map(|key| (ud.UserID, key, ad.server_name.clone())),
+            _ => None,
+        };
+
+    // Initialize the task/notification WebSocket on mount.
     {
         let dispatch = dispatch.clone();
         let ws_initialized = ws_initialized.clone();
-
         use_effect_with((), move |_| {
             if !*ws_initialized {
                 let app_state = Dispatch::<AppState>::global().get();
@@ -144,483 +365,483 @@ pub fn notification_center() -> Html {
         });
     }
 
-    // Auto-hide completed tasks after delay
+    // Open the persistent now-playing socket as soon as credentials are available.
     {
-        let dispatch = dispatch.clone();
-
-        use_effect_with((), move |_| {
-            let interval = gloo_timers::callback::Interval::new(5000, move || {
-                dispatch.reduce_mut(|state| {
-                    if let Some(tasks) = &mut state.active_tasks {
-                        // Auto-cleanup completed tasks after a delay
-                        tasks.retain(|t| {
-                            if let Some(completion_time) = t.completion_time {
-                                // Check if task should be auto-removed
-                                const TASK_DISPLAY_DURATION: f64 = 30000.0; // 30 seconds
-                                let current_time = js_sys::Date::now();
-                                return (current_time - completion_time) < TASK_DISPLAY_DURATION;
-                            }
-                            true
-                        });
-                    }
-                });
-            });
-
-            // Cleanup function to cancel the interval when component unmounts
-            move || drop(interval)
-        });
-    }
-
-    // Get active tasks from state
-    let active_tasks = state.active_tasks.clone().unwrap_or_default();
-
-    // Get error and info messages
-    let error_message = state.error_message.clone();
-    let info_message = state.info_message.clone();
-
-    {
-        let dispatch = dispatch.clone();
-        let info_message = info_message.clone();
-
-        use_effect_with(info_message, move |info| {
-            let timeout = if info.is_some() {
-                // Clear info messages after 5 seconds
-                let dispatch_clone = dispatch.clone();
-                let handle = gloo_timers::callback::Timeout::new(5000, move || {
-                    dispatch_clone.reduce_mut(|state| {
-                        state.info_message = None;
-                    });
-                });
-                Some(handle)
-            } else {
-                None
-            };
-
-            // Return cleanup function to cancel timeout if the component unmounts
-            move || {
-                if let Some(timeout) = timeout {
-                    // Timeout is automatically dropped/cancelled here
-                    drop(timeout);
-                }
+        use_effect_with(creds.clone(), move |creds| {
+            if let Some((user_id, api_key, server_name)) = creds.clone() {
+                crate::requests::now_playing::connect_now_playing_ws(server_name, user_id, api_key);
             }
-        });
-    }
-
-    // Filter tasks based on show_completed setting
-    let filtered_tasks = if *show_completed {
-        active_tasks.clone()
-    } else {
-        active_tasks
-            .iter()
-            .filter(|task| !(task.status == "SUCCESS" || task.status == "FAILED"))
-            .cloned()
-            .collect::<Vec<_>>()
-    };
-
-    // Count active (non-completed) tasks for badge
-    let active_count = active_tasks
-        .iter()
-        .filter(|task| !(task.status == "SUCCESS" || task.status == "FAILED"))
-        .count();
-
-    // Count notifications - active tasks plus any error or info messages
-    {
-        let notification_count = notification_count.clone();
-        let active_count = active_count;
-        let has_error = error_message.is_some();
-        // Info messages no longer count toward the notification badge
-
-        use_effect_with((active_count, has_error), move |(tasks_len, has_error)| {
-            // Info messages are not included in the count
-            let count = *tasks_len + (*has_error as usize);
-            notification_count.set(count);
             || ()
         });
     }
 
-    // Handle toggle dropdown
-    let toggle_dropdown = {
-        let dropdown_open = dropdown_open.clone();
+    // ---- derived data ----
+    let tasks = state.active_tasks.clone().unwrap_or_default();
+    let messages = state.messages.clone();
+
+    let active_tasks: Vec<TaskProgress> =
+        tasks.iter().filter(|t| is_active(&t.status)).cloned().collect();
+    let done_tasks: Vec<TaskProgress> =
+        tasks.iter().filter(|t| is_done(&t.status)).cloned().collect();
+    let error_msgs: Vec<NotificationMessage> = messages
+        .iter()
+        .filter(|m| msg_counts_badge(&m.severity))
+        .cloned()
+        .collect();
+
+    let running: Vec<&TaskProgress> = tasks.iter().filter(|t| is_progress(&t.status)).collect();
+    let running_count = running.len();
+    let progress_avg = if running_count > 0 {
+        running.iter().map(|t| t.progress).sum::<f64>() / running_count as f64
+    } else {
+        0.0
+    };
+
+    let badge = active_tasks.len() + error_msgs.len();
+
+    // ---- callbacks ----
+    let toggle_drawer = {
+        let drawer_open = drawer_open.clone();
         Callback::from(move |e: MouseEvent| {
             e.stop_propagation();
-            dropdown_open.set(!*dropdown_open);
+            drawer_open.set(!*drawer_open);
+        })
+    };
+    let close_drawer = {
+        let drawer_open = drawer_open.clone();
+        Callback::from(move |_| drawer_open.set(false))
+    };
+    let stop = Callback::from(|e: MouseEvent| e.stop_propagation());
+
+    let set_tab = {
+        let tab = tab.clone();
+        move |name: &'static str| {
+            let tab = tab.clone();
+            Callback::from(move |_| tab.set(name.to_string()))
+        }
+    };
+
+    let toggle_group = {
+        let expanded = expanded.clone();
+        Callback::from(move |g: String| {
+            let mut next = (*expanded).clone();
+            if next.contains(&g) {
+                next.remove(&g);
+            } else {
+                next.insert(g);
+            }
+            expanded.set(next);
         })
     };
 
-    // Handle toggle show completed
-    let toggle_show_completed = {
-        let show_completed = show_completed.clone();
-        Callback::from(move |_| {
-            show_completed.set(!*show_completed);
-        })
-    };
-
-    // Handle dismiss all completed tasks
-    let dismiss_completed = {
-        let dispatch = dispatch.clone();
-        Callback::from(move |_| {
-            dispatch.reduce_mut(|state| {
-                if let Some(ref mut tasks) = state.active_tasks {
-                    tasks.retain(|task| !(task.status == "SUCCESS" || task.status == "FAILED"));
-                }
-            });
-        })
-    };
-
-    // Handle dismiss single task
     let dismiss_task = {
         let dispatch = dispatch.clone();
-        Callback::from(move |task_id: String| {
-            dispatch.reduce_mut(|state| {
-                if let Some(ref mut tasks) = state.active_tasks {
-                    tasks.retain(|task| task.task_id != task_id);
+        Callback::from(move |id: String| {
+            dispatch.reduce_mut(move |state| {
+                if let Some(tasks) = &mut state.active_tasks {
+                    tasks.retain(|t| t.task_id != id);
                 }
             });
         })
     };
 
-    // Clear all notifications
-    let clear_all = {
+    let clear_done = {
         let dispatch = dispatch.clone();
         Callback::from(move |_| {
             dispatch.reduce_mut(|state| {
-                state.active_tasks = Some(Vec::new());
-                state.error_message = None;
-                state.info_message = None;
+                if let Some(tasks) = &mut state.active_tasks {
+                    tasks.retain(|t| !is_done(&t.status));
+                }
             });
         })
     };
 
-    // Handle click outside to close dropdown
-    {
-        let dropdown_open = dropdown_open.clone();
-        use_effect_with(*dropdown_open, move |is_open| {
-            if *is_open {
-                // Document click event handling code (unchanged from original)
-                // ...
-                let document = window().unwrap().document().unwrap();
-                let document_clone = document.clone();
-                let dropdown_open = dropdown_open.clone();
-
-                let closure = Closure::wrap(Box::new(move |event: Event| {
-                    let target = event.target().unwrap();
-
-                    // Try to cast as Element first
-                    if let Some(element) = target.dyn_ref::<web_sys::Element>() {
-                        // Check if the click is outside the notification center
-                        let is_notification_click = element.closest(".notification-center").is_ok();
-                        if !is_notification_click {
-                            dropdown_open.set(false);
-                        }
-                    } else if let Some(node) = target.dyn_ref::<web_sys::Node>() {
-                        // If not an element, try to get parent element
-                        if let Some(parent) = node.parent_element() {
-                            let is_notification_click =
-                                parent.closest(".notification-center").is_ok();
-                            if !is_notification_click {
-                                dropdown_open.set(false);
-                            }
-                        } else {
-                            // No parent element, assume outside
-                            dropdown_open.set(false);
-                        }
-                    }
-                }) as Box<dyn FnMut(_)>);
-
-                // Use the original document for adding the listener
-                document
-                    .add_event_listener_with_callback("click", closure.as_ref().unchecked_ref())
-                    .unwrap();
-
-                // Return cleanup function
-                Box::new(move || {
-                    // Use the cloned document for cleanup
-                    let _ = document_clone.remove_event_listener_with_callback(
-                        "click",
-                        closure.as_ref().unchecked_ref(),
-                    );
-                    closure.forget(); // Prevent the closure from being dropped
-                }) as Box<dyn FnOnce()>
-            } else {
-                Box::new(|| ()) as Box<dyn FnOnce()>
+    let dismiss_message = {
+        let dispatch = dispatch.clone();
+        let creds = creds.clone();
+        Callback::from(move |id: String| {
+            {
+                let id = id.clone();
+                dispatch.reduce_mut(move |state| state.messages.retain(|m| m.id != id));
             }
-        });
-    }
+            if let Some((user_id, api_key, server_name)) = creds.clone() {
+                let id = id.clone();
+                spawn_local(async move {
+                    let _ = crate::requests::notify::dismiss_notification(
+                        &server_name,
+                        &api_key,
+                        user_id,
+                        &id,
+                    )
+                    .await;
+                });
+            }
+        })
+    };
 
-    // Render the notification bell and dropdown
-    html! {
-        <div class="notification-center relative">
-            <button
-                type="button"
-                class="notification-bell flex items-center justify-center relative p-2 rounded-full hover:bg-opacity-20"
-                onclick={toggle_dropdown}
-            >
-                <i class="ph ph-bell text-2xl"></i>
-                {
-                    if *notification_count > 0 {
-                        html! {
-                            <span class="notification-badge absolute top-0 right-0 inline-flex items-center justify-center px-2 py-1 text-xs font-bold leading-none transform translate-x-1/2 -translate-y-1/2 rounded-full">
-                                {*notification_count}
-                            </span>
+    let go_settings = {
+        let navigator = navigator.clone();
+        let drawer_open = drawer_open.clone();
+        Callback::from(move |_| {
+            drawer_open.set(false);
+            if let Some(nav) = &navigator {
+                nav.push(&Route::Settings);
+            }
+        })
+    };
+
+    // ---- build sections for the active tab ----
+    // Each section: (label, task render nodes, standalone messages).
+    let mut sections: Vec<(&'static str, Vec<RenderNode>, Vec<NotificationMessage>)> = Vec::new();
+    match tab.as_str() {
+        "active" => {
+            if !active_tasks.is_empty() {
+                sections.push(("In progress", group_tasks(sort_tasks(active_tasks.clone())), vec![]));
+            }
+            if !error_msgs.is_empty() {
+                sections.push(("Needs attention", vec![], error_msgs.clone()));
+            }
+        }
+        "done" => {
+            if !done_tasks.is_empty() {
+                sections.push(("Completed", group_tasks(sort_tasks(done_tasks.clone())), vec![]));
+            }
+        }
+        _ => {
+            if !tasks.is_empty() {
+                sections.push(("Tasks", group_tasks(sort_tasks(tasks.clone())), vec![]));
+            }
+            if !messages.is_empty() {
+                sections.push(("Messages", vec![], messages.clone()));
+            }
+        }
+    }
+    let show_labels = sections.len() > 1;
+    let is_empty = sections.iter().all(|(_, n, m)| n.is_empty() && m.is_empty());
+
+    let empty_copy: (&str, &str) = match tab.as_str() {
+        "active" => (
+            "Nothing running",
+            "Downloads and feed refreshes will show up here.",
+        ),
+        "done" => (
+            "Nothing completed yet",
+            "Finished tasks land here so you can review them.",
+        ),
+        _ => (
+            "You're all caught up",
+            "No downloads, syncs, or messages right now.",
+        ),
+    };
+
+    let show_summary = (tab.as_str() == "all" || tab.as_str() == "active") && running_count > 0;
+    let footer_visible = !done_tasks.is_empty() || !tasks.is_empty() || !messages.is_empty();
+
+    // ---- render one node ----
+    let render_task = |task: &TaskProgress| -> Html {
+        let kind = kind_class(&task.status);
+        let show_prog = is_progress(&task.status);
+        let title = task
+            .details
+            .as_ref()
+            .and_then(|d| d.get("episode_title").or_else(|| d.get("item_title")))
+            .cloned()
+            .unwrap_or_else(|| type_label(&task.r#type));
+        let sub = task.sub_line();
+        let id = task.task_id.clone();
+        let on_dismiss = dismiss_task.clone();
+        html! {
+            <div class={classes!("nc-card", format!("k-{kind}"))}>
+                <span class={classes!("nc-thumb", format!("k-{kind}"))}>
+                    {
+                        if let Some(art) = &task.art_url {
+                            html! { <img src={art.clone()} alt="" /> }
+                        } else {
+                            html! { <i class={classes!("ph", task_icon(&task.r#type))}></i> }
                         }
-                    } else {
-                        html! {}
                     }
+                </span>
+                <div class="nc-main-col">
+                    <div class="nc-line1">{ title }</div>
+                    <div class="nc-line2">
+                        <span>{ type_label(&task.r#type) }</span>
+                        {
+                            if let Some(sub) = &sub {
+                                html! { <><span class="nc-dot-sep">{"·"}</span><span>{ sub.clone() }</span></> }
+                            } else { html! {} }
+                        }
+                    </div>
+                    { if show_prog { render_progress(task.progress, true) } else { html! {} } }
+                </div>
+                <div class="nc-trail">
+                    <span class={classes!("nc-pill", format!("k-{kind}"))}>{ status_label(&task.status) }</span>
+                    {
+                        if is_done(&task.status) {
+                            let on_dismiss = on_dismiss.clone();
+                            html! {
+                                <button class="nc-x" title="Dismiss"
+                                    onclick={Callback::from(move |_| on_dismiss.emit(id.clone()))}>
+                                    <i class="ph ph-x"></i>
+                                </button>
+                            }
+                        } else if show_prog {
+                            html! { <span class="nc-time">{ format!("{}%", task.progress.round() as i64) }</span> }
+                        } else { html! {} }
+                    }
+                </div>
+            </div>
+        }
+    };
+
+    let render_group = |g: &GroupNode| -> Html {
+        let kind = if g.all_done {
+            if g.any_failed { "failed" } else { "success" }
+        } else {
+            "active"
+        };
+        let is_open = expanded.contains(&g.key);
+        let key = g.key.clone();
+        let on_toggle = toggle_group.clone();
+        html! {
+            <>
+                <div class={classes!("nc-card", format!("k-{kind}"), "nc-group-row", is_open.then_some("is-open"))}
+                     style="cursor:pointer"
+                     onclick={Callback::from(move |_| on_toggle.emit(key.clone()))}>
+                    <span class={classes!("nc-thumb", format!("k-{kind}"))}>
+                        {
+                            if let Some(art) = &g.art {
+                                html! { <img src={art.clone()} alt="" /> }
+                            } else {
+                                html! { <i class={classes!("ph", task_icon(&g.ttype))}></i> }
+                            }
+                        }
+                    </span>
+                    <div class="nc-main-col">
+                        <div class="nc-line1">{ g.label.clone() }</div>
+                        <div class="nc-line2">
+                            <span class="nc-count-chip">{ format!("{}/{} done", g.done_count, g.count) }</span>
+                            {
+                                if !g.all_done {
+                                    html! { <><span class="nc-dot-sep">{"·"}</span>
+                                        <span class="nc-status-word k-active">{ format!("{} running", g.active_count) }</span></> }
+                                } else { html! {} }
+                            }
+                        </div>
+                        { if !g.all_done { render_progress(g.progress, true) } else { html! {} } }
+                    </div>
+                    <div class="nc-trail">
+                        <i class="ph ph-caret-right nc-group-caret"></i>
+                    </div>
+                </div>
+                {
+                    if is_open {
+                        html! {
+                            <div class="nc-children">
+                                { for g.children.iter().map(|c| {
+                                    let ck = kind_class(&c.status);
+                                    let ctitle = c.details.as_ref()
+                                        .and_then(|d| d.get("episode_title").or_else(|| d.get("item_title")))
+                                        .cloned()
+                                        .unwrap_or_else(|| c.r#type.clone());
+                                    let cp = if is_progress(&c.status) {
+                                        format!("{}%", c.progress.round() as i64)
+                                    } else { status_label(&c.status) };
+                                    html! {
+                                        <div class="nc-child">
+                                            <span class={classes!("nc-child-dot", format!("k-{ck}"))}></span>
+                                            <span class="nc-child-t">{ ctitle }</span>
+                                            <span class="nc-child-p">{ cp }</span>
+                                        </div>
+                                    }
+                                }) }
+                            </div>
+                        }
+                    } else { html! {} }
                 }
+            </>
+        }
+    };
+
+    let render_message = |m: &NotificationMessage| -> Html {
+        let (kind, icon) = msg_kind(&m.severity);
+        let id = m.id.clone();
+        let on_dismiss = dismiss_message.clone();
+        let rel = parse_rfc3339_ms(&m.created_at).map(rel_time).unwrap_or_default();
+        html! {
+            <div class={classes!("nc-card", format!("k-{kind}"))}>
+                <span class={classes!("nc-thumb", format!("k-{kind}"))}>
+                    {
+                        if let Some(art) = &m.art_url {
+                            html! { <img src={art.clone()} alt="" /> }
+                        } else {
+                            html! { <i class={classes!("ph", icon)}></i> }
+                        }
+                    }
+                </span>
+                <div class="nc-main-col">
+                    <div class="nc-line1" style="white-space:normal;line-height:1.4">{ m.title.clone() }</div>
+                    {
+                        if let Some(body) = &m.body {
+                            html! { <div class="nc-line2" style="white-space:normal">{ body.clone() }</div> }
+                        } else { html! {} }
+                    }
+                    <div class="nc-line2"><span class="nc-time" style="opacity:.7">{ rel }</span></div>
+                </div>
+                <div class="nc-trail">
+                    <button class="nc-x" title="Dismiss"
+                        onclick={Callback::from(move |_| on_dismiss.emit(id.clone()))}>
+                        <i class="ph ph-x"></i>
+                    </button>
+                </div>
+            </div>
+        }
+    };
+
+    let bell_icon = if badge > 0 { "ph-bell-ringing" } else { "ph-bell" };
+    let badge_text = if badge > 9 { "9+".to_string() } else { badge.to_string() };
+
+    html! {
+        <div class="notification-center">
+            <button type="button"
+                class={classes!("nc-bell", (*drawer_open).then_some("is-open"))}
+                onclick={toggle_drawer} title="Activity" aria-label="Activity">
+                <i class={classes!("ph", bell_icon)}></i>
+                { if badge > 0 { html! { <span class="nc-bell-badge">{ badge_text }</span> } } else { html! {} } }
             </button>
 
-            {
-                if *dropdown_open {
-                    html! {
-                        <div class="notification-dropdown absolute right-0 mt-2 w-80 max-h-96 overflow-y-auto z-50" onclick={Callback::from(|e: MouseEvent| e.stop_propagation())}>
-                            <div class="notification-header flex justify-between items-center p-3 border-b border-color">
-                                <h3 class="text-lg font-semibold">{&i18n_notifications}</h3>
-                                <div class="flex space-x-2">
-                                    <button
-                                        class="text-sm px-2 py-1 rounded hover:bg-opacity-20"
-                                        onclick={toggle_show_completed}
-                                        title={if *show_completed { i18n_hide_completed.clone() } else { i18n_show_completed.clone() }}
-                                    >
-                                        <i class={if *show_completed { "ph ph-eye-slash" } else { "ph ph-eye" }}></i>
-                                    </button>
-                                    <button
-                                        class="text-sm px-2 py-1 rounded hover:bg-opacity-20"
-                                        onclick={clear_all}
-                                        title={i18n_clear_all.clone()}
-                                    >
-                                        <i class="ph ph-trash"></i>
+            // Scrim + panel stay mounted; the `.is-open` class drives the CSS
+            // transition both ways so closing animates (not just opening).
+            <div class={classes!("nc-scrim", (*drawer_open).then_some("is-open"))} onclick={close_drawer.clone()}></div>
+            <div class={classes!("nc-panel", "nc-dir-2", "nc-form-drawer", (*drawer_open).then_some("is-open"))}
+                 data-density="compact" onclick={stop}>
+                                <div class="nc-header">
+                                    <h3 class="nc-h-title">{"Activity"}</h3>
+                                    <div class="nc-h-spacer"></div>
+                                    <button class="nc-h-btn" title="Close" onclick={close_drawer.clone()}>
+                                        <i class="ph ph-arrow-line-right"></i>
                                     </button>
                                 </div>
-                            </div>
 
-                            <div class="item_container-text notification-body p-2">
+                                <div class="nc-tabs">
+                                    { render_tab("all", "All", tasks.len() + messages.len(), &tab, set_tab("all")) }
+                                    { render_tab("active", "Active", active_tasks.len() + error_msgs.len(), &tab, set_tab("active")) }
+                                    { render_tab("done", "Done", done_tasks.len(), &tab, set_tab("done")) }
+                                </div>
+
                                 {
-                                    // Render tasks
-                                    if !filtered_tasks.is_empty() {
+                                    if show_summary {
                                         html! {
-                                            <div class="mb-2">
-                                                <div class="flex justify-between items-center">
-                                                    <h4 class="text-sm font-medium px-2 py-1">{if *show_completed { &i18n_all_tasks } else { &i18n_active_tasks }}</h4>
-                                                    {
-                                                        if filtered_tasks.iter().any(|t| t.status == "SUCCESS" || t.status == "FAILED") {
-                                                            html! {
-                                                                <button
-                                                                    class="text-xs px-2 py-1 rounded hover:bg-opacity-20"
-                                                                    onclick={dismiss_completed}
-                                                                    title={i18n_dismiss_all_completed.clone()}
-                                                                >
-                                                                    {&i18n_dismiss_completed}
-                                                                </button>
+                                            <div class="nc-summary">
+                                                <div class="nc-summary-top">
+                                                    <span class="nc-spinner"><i class="ph ph-circle-notch"></i></span>
+                                                    <span>{ format!("{} {} running", running_count, if running_count == 1 { "task" } else { "tasks" }) }</span>
+                                                    <span class="nc-summary-pct">{ format!("{}%", progress_avg.round() as i64) }</span>
+                                                </div>
+                                                { render_progress(progress_avg, false) }
+                                            </div>
+                                        }
+                                    } else { html! {} }
+                                }
+
+                                <div class="nc-body">
+                                    {
+                                        if is_empty {
+                                            html! {
+                                                <div class="nc-empty">
+                                                    <span class="nc-empty-ico"><i class="ph ph-check-circle"></i></span>
+                                                    <div class="nc-empty-t">{ empty_copy.0 }</div>
+                                                    <div class="nc-empty-s">{ empty_copy.1 }</div>
+                                                </div>
+                                            }
+                                        } else {
+                                            html! {
+                                                { for sections.iter().map(|(label, nodes, msgs)| {
+                                                    let count = nodes.len() + msgs.len();
+                                                    let is_done_section = *label == "Completed";
+                                                    let clear_done = clear_done.clone();
+                                                    html! {
+                                                        <div>
+                                                            {
+                                                                if show_labels {
+                                                                    html! {
+                                                                        <div class="nc-section-label">
+                                                                            <span>{ *label }</span>
+                                                                            <span class="n">{ count }</span>
+                                                                            {
+                                                                                if is_done_section {
+                                                                                    html! { <button class="nc-section-clear"
+                                                                                        onclick={Callback::from(move |_| clear_done.emit(()))}>{"Clear"}</button> }
+                                                                                } else { html! {} }
+                                                                            }
+                                                                        </div>
+                                                                    }
+                                                                } else { html! {} }
                                                             }
-                                                        } else {
-                                                            html! {}
-                                                        }
+                                                            { for nodes.iter().map(|n| match n {
+                                                                RenderNode::Task(t) => render_task(t),
+                                                                RenderNode::Group(g) => render_group(g),
+                                                            }) }
+                                                            { for msgs.iter().map(|m| render_message(m)) }
+                                                        </div>
                                                     }
-                                                </div>
+                                                }) }
+                                            }
+                                        }
+                                    }
+                                </div>
+
+                                {
+                                    if footer_visible {
+                                        let clear_done_footer = clear_done.clone();
+                                        html! {
+                                            <div class="nc-footer">
                                                 {
-                                                    filtered_tasks.iter().map(|task| {
-                                                        // Task item HTML - similar to the original but with dismiss button
-                                                        let task_id = task.task_id.clone();
-                                                        let task_dismiss = dismiss_task.clone();
-                                                        let on_dismiss = Callback::from(move |_| task_dismiss.emit(task_id.clone()));
-
-                                                        // Determine status styling
-                                                        let status_str = task.status.as_str();
-                                                        let (status_class, status_text) = match status_str {
-                                                            "PENDING" => ("status-pending", i18n_queued.as_str()),
-                                                            "STARTED" => ("status-started", i18n_in_progress.as_str()),
-                                                            "PROGRESS" => ("status-started", i18n_in_progress.as_str()),
-                                                            "DOWNLOADING" => ("status-started", i18n_downloading.as_str()),
-                                                            "PROCESSING" => ("status-started", i18n_processing.as_str()),
-                                                            "FINALIZING" => ("status-started", i18n_finalizing.as_str()),
-                                                            "SUCCESS" => ("status-success", i18n_completed.as_str()),
-                                                            "FAILED" => ("status-failed", i18n_failed.as_str()),
-                                                            _ => ("status-started", status_str),
-                                                        };
-
-                                                        // Get task type display name
-                                                        let task_type_display = match task.r#type.as_str() {
-                                                            "podcast_download" | "download_episode" => i18n_download.as_str(),
-                                                            "feed_refresh" => i18n_feed_refresh.as_str(),
-                                                            "playlist_generation" => i18n_playlist.as_str(),
-                                                            "youtube_download" | "download_video" => i18n_youtube_download.as_str(),
-                                                            "bulk_download" | "download_all_episodes" => i18n_bulk_download.as_str(),
-                                                            "download_all_videos" => i18n_youtube_bulk_download.as_str(),
-                                                            "opml_import" => i18n_opml_import.as_str(),
-                                                            "add_podcast_episodes" => i18n_add_podcast.as_str(),
-                                                            "manual_backup_to_directory" => i18n_backup.as_str(),
-                                                            "restore_from_backup_file" => i18n_restore.as_str(),
-                                                            "refresh_gpodder_subscriptions" | "gpodder_subscription_refresh" => i18n_gpodder_sync.as_str(),
-                                                            "refresh_nextcloud_subscriptions" => i18n_nextcloud_sync.as_str(),
-                                                            "nextcloud_auth" => i18n_nextcloud_auth.as_str(),
-                                                            "update_playlists" => i18n_playlist_update.as_str(),
-                                                            "cleanup_tasks" => i18n_cleanup.as_str(),
-                                                            "refresh_hosts" => i18n_refresh_hosts.as_str(),
-                                                            _ => &task.r#type
-                                                        };
-
-                                                        // Get status detail text if available
-                                                        let status_detail = task.details.as_ref()
-                                                            .and_then(|details| details.get("status_text"))
-                                                            .map(|s| s.as_str())
-                                                            .unwrap_or("");
-
-                                                        // Construct episode title or fall back to generic description
-                                                        let item_description = task.details.as_ref()
-                                                            .and_then(|details| {
-                                                                // Try different possible key names for the title
-                                                                details.get("episode_title")
-                                                                    .or_else(|| details.get("item_title"))      // For YouTube videos
-                                                            })
-                                                            .map(|s| s.as_str())
-                                                            .unwrap_or(match task.r#type.as_str() {
-                                                                "podcast_download" => i18n_episode.as_str(),
-                                                                "youtube_download" => i18n_youtube_video.as_str(),
-                                                                _ => i18n_item.as_str()
-                                                            });
-
-                                                        // Calculate if we should show progress (any active download/processing status)
-                                                        let show_progress = matches!(status_str,
-                                                            "STARTED" | "PROGRESS" | "DOWNLOADING" | "PROCESSING" | "FINALIZING");
-
-                                                        html! {
-                                                            <div class="notification-item p-3 mb-2 rounded">
-                                                                <div class="flex justify-between items-center mb-1">
-                                                                    <div class="flex items-center">
-                                                                        <span class="font-medium">{task_type_display}</span>
-                                                                        <span class={format!("notification-status ml-2 px-2 py-1 rounded-full text-xs {}", status_class)}>
-                                                                            {status_text}
-                                                                        </span>
-                                                                    </div>
-                                                                    <button
-                                                                        class="dismiss-button text-xs hover:opacity-70"
-                                                                        onclick={on_dismiss}
-                                                                        title={i18n_dismiss_notification.clone()}
-                                                                    >
-                                                                        <i class="ph ph-x"></i>
-                                                                    </button>
-                                                                </div>
-                                                                {
-                                                                    if !status_detail.is_empty() {
-                                                                        html! { <p class="text-xs mb-2">{status_detail}</p> }
-                                                                    } else if task.item_id.is_some() {
-                                                                        html! { <p class="text-xs mb-2">{item_description}</p> }
-                                                                    } else {
-                                                                        html! {}
-                                                                    }
-                                                                }
-                                                                {
-                                                                    if show_progress {
-                                                                        html! {
-                                                                            <div class="flex items-center">
-                                                                                <div class="notification-progress-bar-container flex-grow h-2 rounded overflow-hidden">
-                                                                                    <div
-                                                                                        class="progress-bar-fill h-full"
-                                                                                        style={format!("width: {}%", task.progress)}
-                                                                                    ></div>
-                                                                                </div>
-                                                                                <span class="progress-text ml-2 text-xs">{format!("{:.0}%", task.progress)}</span>
-                                                                            </div>
-                                                                        }
-                                                                    } else {
-                                                                        html! {}
-                                                                    }
-                                                                }
-                                                            </div>
-                                                        }
-                                                    }).collect::<Html>()
+                                                    if !done_tasks.is_empty() {
+                                                        html! { <button class="nc-foot-btn"
+                                                            onclick={Callback::from(move |_| clear_done_footer.emit(()))}>
+                                                            <i class="ph ph-check"></i>{"Clear completed"}</button> }
+                                                    } else {
+                                                        html! { <span style="font-size:12px;opacity:.55;padding:6px 8px">{ format!("{} active", running_count) }</span> }
+                                                    }
                                                 }
+                                                <div class="nc-foot-spacer"></div>
+                                                <button class="nc-foot-btn" title="Notification settings" onclick={go_settings}>
+                                                    <i class="ph ph-gear"></i>{"Settings"}
+                                                </button>
                                             </div>
                                         }
-                                    } else {
-                                        html! {}
-                                    }
+                                    } else { html! {} }
                                 }
-
-                                {
-                                    // Render error messages with dismiss button
-                                    if let Some(error) = &error_message {
-                                        let dispatch_clone = dispatch.clone();
-                                        let dismiss_error = Callback::from(move |_| {
-                                            dispatch_clone.reduce_mut(|state| {
-                                                state.error_message = None;
-                                            });
-                                        });
-
-                                        html! {
-                                            <div class="notification-item notification-error p-3 mb-2 rounded">
-                                                <div class="flex justify-between items-start">
-                                                    <div class="flex items-start">
-                                                        <i class="ph ph-warning-circle text-xl mr-2"></i>
-                                                        <p class="text-sm">{error}</p>
-                                                    </div>
-                                                    <button
-                                                        class="dismiss-button text-xs hover:opacity-70 ml-2"
-                                                        onclick={dismiss_error}
-                                                        title={i18n_dismiss_error.clone()}
-                                                    >
-                                                        <i class="ph ph-x"></i>
-                                                    </button>
-                                                </div>
-                                            </div>
-                                        }
-                                    } else {
-                                        html! {}
-                                    }
-                                }
-
-                                {
-                                    // Render info messages with dismiss button
-                                    if let Some(info) = &info_message {
-                                        let dispatch_clone = dispatch.clone();
-                                        let dismiss_info = Callback::from(move |_| {
-                                            dispatch_clone.reduce_mut(|state| {
-                                                state.info_message = None;
-                                            });
-                                        });
-
-                                        html! {
-                                            <div class="notification-item notification-info p-3 mb-2 rounded">
-                                                <div class="flex justify-between items-start">
-                                                    <div class="flex items-start">
-                                                        <i class="ph ph-info text-xl mr-2"></i>
-                                                        <p class="text-sm">{info}</p>
-                                                    </div>
-                                                    <button
-                                                        class="dismiss-button text-xs hover:opacity-70 ml-2"
-                                                        onclick={dismiss_info}
-                                                        title={i18n_dismiss_message.clone()}
-                                                    >
-                                                        <i class="ph ph-x"></i>
-                                                    </button>
-                                                </div>
-                                            </div>
-                                        }
-                                    } else {
-                                        html! {}
-                                    }
-                                }
-
-                                {
-                                    // If no notifications at all
-                                    if filtered_tasks.is_empty() && error_message.is_none() && info_message.is_none() {
-                                        html! {
-                                            <div class="p-3 text-center notification-empty">
-                                                <p class="text-sm">{&i18n_no_notifications}</p>
-                                            </div>
-                                        }
-                                    } else {
-                                        html! {}
-                                    }
-                                }
-                            </div>
-                        </div>
-                    }
-                } else {
-                    html! {}
-                }
-            }
+            </div>
         </div>
+    }
+}
+
+fn render_progress(progress: f64, show_pct: bool) -> Html {
+    let width = progress.clamp(2.0, 100.0);
+    html! {
+        <div class="nc-prog">
+            <div class="nc-prog-track">
+                <div class="nc-prog-fill" style={format!("width:{}%", width)}></div>
+            </div>
+            { if show_pct { html! { <span class="nc-prog-pct">{ format!("{}%", progress.round() as i64) }</span> } } else { html! {} } }
+        </div>
+    }
+}
+
+fn render_tab(
+    id: &str,
+    label: &str,
+    n: usize,
+    active: &UseStateHandle<String>,
+    onclick: Callback<MouseEvent>,
+) -> Html {
+    let is_active = active.as_str() == id;
+    html! {
+        <button class={classes!("nc-tab", is_active.then_some("is-active"))} {onclick}>
+            { label }
+            { if n > 0 { html! { <span class="nc-tab-pip">{ n }</span> } } else { html! {} } }
+        </button>
     }
 }
 
@@ -657,19 +878,13 @@ pub fn toast_notification() -> Html {
                     let mut new_queue: Vec<ToastItem> = (*toast_queue).clone();
                     let mut changed = false;
 
-                    // First check for toasts that need to be hidden
                     for toast in new_queue.iter_mut() {
                         if toast.visible && now >= toast.expiry_time {
                             toast.visible = false;
                             changed = true;
-                            log(&format!(
-                                "Auto-hiding toast #{}: '{}'",
-                                toast.id, toast.content
-                            ));
                         }
                     }
 
-                    // Then remove toasts that have been hidden for at least 500ms (animation time)
                     let before_len = new_queue.len();
                     new_queue.retain(|toast| toast.visible || now < toast.expiry_time + 500.0);
                     if new_queue.len() != before_len {
@@ -699,17 +914,14 @@ pub fn toast_notification() -> Html {
 
         use_effect_with(error_message.clone(), move |error_message| {
             if let Some(error_msg) = error_message {
-                // Check if this exact message is already in the queue
                 let existing_message = (*toast_queue).iter().any(|toast: &ToastItem| {
                     toast.content == *error_msg && toast.toast_type == "error" && toast.visible
                 });
 
                 if !existing_message {
-                    log(&format!("Adding new error toast: {}", error_msg));
                     let new_id = *counter;
                     counter.set(new_id + 1);
 
-                    // Set expiry 5 seconds from now
                     let now = js_sys::Date::now();
                     let expiry_time = now + 5000.0;
 
@@ -727,7 +939,6 @@ pub fn toast_notification() -> Html {
                         new_queue
                     });
 
-                    // Clear the error message after a delay
                     let dispatch_clone = dispatch.clone();
                     let error_msg_clone = error_msg.clone();
                     let handle = Timeout::new(5500, move || {
@@ -754,17 +965,14 @@ pub fn toast_notification() -> Html {
 
         use_effect_with(info_message.clone(), move |info_message| {
             if let Some(info_msg) = info_message {
-                // Check if this exact message is already in the queue
                 let existing_message = (*toast_queue).iter().any(|toast: &ToastItem| {
                     toast.content == *info_msg && toast.toast_type == "info" && toast.visible
                 });
 
                 if !existing_message {
-                    log(&format!("Adding new info toast: {}", info_msg));
                     let new_id = *counter;
                     counter.set(new_id + 1);
 
-                    // Set expiry 5 seconds from now
                     let now = js_sys::Date::now();
                     let expiry_time = now + 5000.0;
 
@@ -782,7 +990,6 @@ pub fn toast_notification() -> Html {
                         new_queue
                     });
 
-                    // Clear the info message after a delay
                     let dispatch_clone = dispatch.clone();
                     let info_msg_clone = info_msg.clone();
                     let handle = Timeout::new(5500, move || {
@@ -832,7 +1039,6 @@ pub fn toast_notification() -> Html {
                                             {toast.content.clone()}
                                         </p>
                                     </div>
-                                    // Add manual close button
                                     <button
                                         class="toast-dismiss text-lg ml-2"
                                         onclick={

@@ -13,10 +13,11 @@ use crate::requests::pod_req::{
     call_add_history, call_check_episode_in_db, call_fetch_podcasting_2_data,
     call_get_episode_skip_segments,
     call_get_auto_play_next_status, call_get_next_playlist_episode, call_get_next_podcast_episode,
-    call_get_play_episode_details, call_get_podcast_id_from_ep, call_get_queued_episodes,
+    call_get_episode_metadata, call_get_play_episode_details, call_get_podcast_id_from_ep,
+    call_get_queued_episodes,
     call_increment_listen_time, call_increment_played, call_mark_episode_completed,
-    call_queue_episode, call_record_listen_duration, call_remove_queued_episode,
-    call_update_episode_duration, HistoryAddRequest, MarkEpisodeCompletedRequest,
+    call_move_queue_episode_to_top, call_record_listen_duration,
+    call_update_episode_duration, EpisodeRequest, HistoryAddRequest, MarkEpisodeCompletedRequest,
     QueuePodcastRequest, RecordListenDurationRequest, UpdateEpisodeDurationRequest,
 };
 use gloo_timers::callback::Interval;
@@ -335,6 +336,25 @@ pub fn audio_player(props: &AudioPlayerProps) -> Html {
                 || ()
             },
         );
+    }
+
+    // Keep the live media element's volume in sync with `audio_volume` state. The element is
+    // created imperatively (HtmlAudioElement::new) with no attribute/node_ref binding, so a
+    // state change (notably the async default-volume seed above) otherwise never reaches the
+    // DOM — leaving playback muted until the slider is nudged (#828/#775).
+    {
+        let audio_dispatch = _audio_dispatch.clone();
+        use_effect_with(audio_state.audio_volume, move |vol| {
+            let vol = *vol;
+            audio_dispatch.reduce_mut(|state| {
+                if let Some(media) = &state.media_element {
+                    media.set_volume(vol / 100.0);
+                } else if let Some(el) = &state.audio_element {
+                    el.set_volume(vol / 100.0);
+                }
+            });
+            || ()
+        });
     }
 
     let episode_id = audio_state
@@ -705,6 +725,47 @@ pub fn audio_player(props: &AudioPlayerProps) -> Html {
             }
         });
     }
+
+    // Report this device's now-playing state to the server every few seconds for
+    // cross-device awareness + remote control. Best-effort; reads the live global
+    // player state and the freshest position straight off the media element.
+    {
+        use_effect_with((), move |_| {
+            let interval = gloo_timers::callback::Interval::new(4000, move || {
+                let state = Dispatch::<UIState>::global().get();
+                if let Some(cp) = state.currently_playing.as_ref() {
+                    let position = state
+                        .media_element
+                        .as_ref()
+                        .map(|m| m.current_time())
+                        .unwrap_or(state.current_time_seconds);
+                    crate::requests::now_playing::send_report(
+                        cp.episode_id,
+                        cp.is_youtube,
+                        &cp.title,
+                        &cp.artwork_url,
+                        position,
+                        cp.duration_sec,
+                        state.audio_playing.unwrap_or(false),
+                        if state.playback_speed > 0.0 {
+                            state.playback_speed
+                        } else {
+                            1.0
+                        },
+                    );
+                } else {
+                    crate::requests::now_playing::send_heartbeat();
+                }
+            });
+            move || drop(interval)
+        });
+    }
+
+    // NOTE: the inbound "play this episode" / "Play here" observer used to live
+    // here, but AudioPlayer is only mounted while something is already playing on
+    // this device — so an idle tab could never START remote playback. It now lives
+    // in the always-mounted `RemoteDevices` component (components/remote_devices.rs)
+    // via `apply_pending_remote_play`, which observes `pending_remote_play`.
 
     // Effect for setting up an interval to update the current playback time
     // Clone `audio_ref` for `use_effect_with`
@@ -1176,106 +1237,55 @@ pub fn audio_player(props: &AudioPlayerProps) -> Html {
                                             .into(),
                                     );
 
-                                    // Remove the current episode from the queue
-                                    if let Some(current_episode) = episodes
-                                        .iter()
-                                        .find(|ep| ep.episodeid == current_episode_id.unwrap())
-                                    {
-                                        web_sys::console::log_1(&format!("Found current episode in queue (ID: {}), removing it", current_episode.episodeid).into());
-                                        let request = QueuePodcastRequest {
-                                            episode_id: current_episode_id.clone().unwrap(),
-                                            user_id: user_id.clone().unwrap(),
-                                            is_youtube: current_episode.is_youtube,
-                                        };
-                                        let _ = call_remove_queued_episode(
-                                            &server_name.clone().unwrap(),
-                                            &api_key.clone().unwrap(),
-                                            &request,
-                                        )
-                                        .await;
-                                    }
+                                    // The finished episode and any completed leftovers are
+                                    // removed from the queue server-side by
+                                    // mark_episode_completed, so we don't remove them here.
+                                    // Pick the next episode locally from the fetched list,
+                                    // skipping the just-finished and any completed episodes.
+                                    let mut sorted_episodes: Vec<_> = episodes
+                                        .into_iter()
+                                        .filter(|ep| {
+                                            Some(ep.episodeid) != current_episode_id && !ep.completed
+                                        })
+                                        .collect();
+                                    sorted_episodes
+                                        .sort_by_key(|ep| ep.queueposition.unwrap_or(999999));
 
-                                    // Remove any completed episodes from the queue
-                                    for ep in episodes.iter().filter(|ep| ep.completed) {
-                                        if Some(ep.episodeid) != current_episode_id {
-                                            web_sys::console::log_1(&format!("Removing completed episode from queue: {} (ID: {})", ep.episodetitle, ep.episodeid).into());
-                                            let request = QueuePodcastRequest {
-                                                episode_id: ep.episodeid,
-                                                user_id: user_id.clone().unwrap(),
-                                                is_youtube: ep.is_youtube,
-                                            };
-                                            let _ = call_remove_queued_episode(
-                                                &server_name.clone().unwrap(),
-                                                &api_key.clone().unwrap(),
-                                                &request,
+                                    if let Some(next_episode) = sorted_episodes.first() {
+                                        web_sys::console::log_1(&format!("Playing next episode in queue: {} (ID: {}, Position: {})",
+                                            next_episode.episodetitle,
+                                            next_episode.episodeid,
+                                            next_episode.queueposition.unwrap_or(0)
+                                        ).into());
+
+                                        if let (
+                                            Some(Some(api_key_val)),
+                                            Some(user_id_val),
+                                            Some(server_name_val),
+                                        ) = (api_key.clone(), user_id, server_name.clone())
+                                        {
+                                            on_play_click(
+                                                next_episode.clone(),
+                                                api_key_val,
+                                                user_id_val,
+                                                server_name_val,
+                                                audio_dispatch.clone(),
+                                                audio_state.clone(),
+                                                false,
+                                                false,
+                                                None,
                                             )
-                                            .await;
+                                            .emit(MouseEvent::new("click").unwrap());
+                                        } else {
+                                            web_sys::console::log_1(&"ERROR: Missing required auth data".into());
                                         }
-                                    }
-
-                                    // Re-fetch the queue to get updated positions after removals
-                                    let updated_result = call_get_queued_episodes(
-                                        &server_name.clone().unwrap(),
-                                        &api_key.clone().unwrap(),
-                                        &user_id.clone().unwrap(),
-                                    )
-                                    .await;
-
-                                    match updated_result {
-                                        Ok(updated_episodes) => {
-                                            if updated_episodes.is_empty() {
-                                                web_sys::console::log_1(
-                                                    &"Queue is empty after cleanup, stopping playback".into(),
-                                                );
-                                                audio_dispatch.reduce_mut(|state| {
-                                                    state.audio_playing = Some(false);
-                                                });
-                                            } else {
-                                                // Sort by queue position and play the first one
-                                                let mut sorted_episodes = updated_episodes;
-                                                sorted_episodes
-                                                    .sort_by_key(|ep| ep.queueposition.unwrap_or(999999));
-
-                                                if let Some(next_episode) = sorted_episodes.first() {
-                                                    web_sys::console::log_1(&format!("Playing first episode in queue: {} (ID: {}, Position: {})",
-                                                        next_episode.episodetitle,
-                                                        next_episode.episodeid,
-                                                        next_episode.queueposition.unwrap_or(0)
-                                                    ).into());
-
-                                                    if let (
-                                                        Some(Some(api_key_val)),
-                                                        Some(user_id_val),
-                                                        Some(server_name_val),
-                                                    ) = (api_key.clone(), user_id, server_name.clone())
-                                                    {
-                                                        on_play_click(
-                                                            next_episode.clone(),
-                                                            api_key_val,
-                                                            user_id_val,
-                                                            server_name_val,
-                                                            audio_dispatch.clone(),
-                                                            audio_state.clone(),
-                                                            false,
-                                                            false,
-                                                            None,
-                                                        )
-                                                        .emit(MouseEvent::new("click").unwrap());
-                                                    } else {
-                                                        web_sys::console::log_1(&"ERROR: Missing required auth data".into());
-                                                    }
-                                                } else {
-                                                    audio_dispatch.reduce_mut(|state| {
-                                                        state.audio_playing = Some(false);
-                                                    });
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            web_sys::console::log_1(
-                                                &format!("Failed to re-fetch queue: {:?}", e).into(),
-                                            );
-                                        }
+                                    } else {
+                                        web_sys::console::log_1(
+                                            &"Queue is empty after cleanup, stopping playback".into(),
+                                        );
+                                        audio_dispatch.reduce_mut(|state| {
+                                            state.audio_playing = Some(false);
+                                        });
                                     }
                                 }
                                 Err(e) => {
@@ -2234,17 +2244,22 @@ pub fn on_play_click(
                             episode_id: episode.episodeid,
                             user_id,
                             is_youtube: episode.is_youtube,
+                            playing_episode_id: None,
+                            playing_is_youtube: None,
                         };
 
                         let queue_api = Option::from(queue_api_key);
 
-                        let add_queue_future = call_queue_episode(&queue_server_name, &queue_api, &request);
+                        // Playing an episode makes it the queue anchor: move it to the
+                        // top (inserting it if it wasn't queued), rather than appending.
+                        let add_queue_future =
+                            call_move_queue_episode_to_top(&queue_server_name, &queue_api, &request);
                         match add_queue_future.await {
                             Ok(_) => {
-                                // web_sys::console::log_1(&"Successfully Added Episode to Queue".into());
+                                // web_sys::console::log_1(&"Moved episode to top of queue".into());
                             }
                             Err(_e) => {
-                                // web_sys::console::log_1(&format!("Failed to add to queue: {:?}", e).into());
+                                // web_sys::console::log_1(&format!("Failed to bump queue: {:?}", e).into());
                             }
                         }
                     }
@@ -2448,7 +2463,7 @@ pub fn on_play_click(
                                     });
                                     // Use new media_element that supports both audio and video
                                     audio_state.set_media_source(src.to_string(), episode.is_video, dispatch_for_media);
-                                    let session_vol = audio_state.audio_volume;
+                                    let session_vol = audio_state.effective_volume();
                                     if let Some(media) = &audio_state.media_element {
                                         media.set_current_time(start_pos_sec);
                                         // Set the playback speed on the media element as well
@@ -2505,7 +2520,7 @@ pub fn on_play_click(
                     });
                     // Use new media_element that supports both audio and video
                     audio_state.set_media_source(src.to_string(), episode.is_video, dispatch_for_media);
-                    let session_vol = audio_state.audio_volume;
+                    let session_vol = audio_state.effective_volume();
                     if let Some(media) = &audio_state.media_element {
                         // Apply the live session volume to the new element (#828/#775)
                         media.set_volume(session_vol / 100.0);
@@ -2705,7 +2720,7 @@ pub fn on_play_click_offline(
                         });
                         // Use new media_element that supports both audio and video
                         audio_state.set_media_source(src.to_string(), episode.is_video, dispatch_for_media);
-                        let session_vol = audio_state.audio_volume;
+                        let session_vol = audio_state.effective_volume();
                         if let Some(media) = &audio_state.media_element {
                             media.set_current_time(listen_duration_for_closure as f64);
                             // Apply the live session volume to the new element (#828/#775)
@@ -2850,7 +2865,7 @@ pub fn on_play_click_shared(
                     is_video: false, // Local playback assumed to be audio for now
                 });
                 audio_state.set_audio_source(episode_url.clone());
-                let session_vol = audio_state.audio_volume;
+                let session_vol = audio_state.effective_volume();
                 // Support both media_element and legacy audio_element
                 if let Some(media) = &audio_state.media_element {
                     // Apply the live session volume to the new element (#828/#775)

@@ -14,6 +14,7 @@ import 'package:pinepods_mobile/ui/podcast/now_playing_floating_player.dart';
 import 'package:pinepods_mobile/ui/podcast/now_playing_options.dart';
 import 'package:pinepods_mobile/ui/podcast/person_avatar.dart';
 import 'package:pinepods_mobile/ui/podcast/playback_error_listener.dart';
+import 'package:pinepods_mobile/ui/podcast/remote_devices_button.dart';
 import 'package:pinepods_mobile/ui/podcast/player_position_controls.dart';
 import 'package:pinepods_mobile/ui/podcast/player_transport_controls.dart';
 import 'package:pinepods_mobile/ui/widgets/delayed_progress_indicator.dart';
@@ -485,6 +486,9 @@ class NowPlayingTabs extends StatelessWidget {
                   Navigator.pop(context),
                 },
               ),
+              actions: const [
+                RemoteDevicesButton(),
+              ],
               flexibleSpace: PlaybackErrorListener(
                 child: Column(
                   mainAxisAlignment: MainAxisAlignment.end,

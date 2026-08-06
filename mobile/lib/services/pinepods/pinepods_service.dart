@@ -441,7 +441,16 @@ class PinepodsService {
   }
 
   // Queue episode
-  Future<bool> queueEpisode(int episodeId, int userId, bool isYoutube) async {
+  /// Add an episode to the queue. When [playingEpisodeId] is provided, the server
+  /// inserts the new episode directly under the currently-playing item ("play
+  /// next"); otherwise it goes to the top of the queue.
+  Future<bool> queueEpisode(
+    int episodeId,
+    int userId,
+    bool isYoutube, {
+    int? playingEpisodeId,
+    bool? playingIsYoutube,
+  }) async {
     if (_server == null || _apiKey == null) {
       throw Exception('Not authenticated');
     }
@@ -454,6 +463,8 @@ class PinepodsService {
         'episode_id': episodeId,
         'user_id': userId,
         'is_youtube': isYoutube,
+        if (playingEpisodeId != null) 'playing_episode_id': playingEpisodeId,
+        if (playingIsYoutube != null) 'playing_is_youtube': playingIsYoutube,
       });
 
       final response = await _post(
@@ -466,6 +477,36 @@ class PinepodsService {
       return response.statusCode == 200;
     } catch (e) {
       _devLog('Error queueing episode: $e');
+      return false;
+    }
+  }
+
+  /// Move an episode to the top of the queue (position 1), inserting it if it
+  /// isn't queued yet. Used when a device starts playing so the currently-playing
+  /// episode is always the queue anchor.
+  Future<bool> moveQueueEpisodeToTop(
+    int episodeId,
+    int userId,
+    bool isYoutube,
+  ) async {
+    if (_server == null || _apiKey == null) {
+      throw Exception('Not authenticated');
+    }
+
+    final url = Uri.parse('$_server/api/data/queue_bump');
+    try {
+      final response = await _post(
+        url,
+        headers: {'Api-Key': _apiKey!, 'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'episode_id': episodeId,
+          'user_id': userId,
+          'is_youtube': isYoutube,
+        }),
+      );
+      return response.statusCode == 200;
+    } catch (e) {
+      _devLog('Error moving episode to top of queue: $e');
       return false;
     }
   }
@@ -2393,7 +2434,12 @@ class PinepodsService {
   }
 
   // Reorder queue episodes
-  Future<bool> reorderQueue(int userId, List<int> episodeIds) async {
+  /// Reorder the queue. Each entry carries `is_youtube` so the server can tell a
+  /// podcast episode id from a YouTube video id that share the same integer.
+  Future<bool> reorderQueue(
+    int userId,
+    List<({int episodeId, bool isYoutube})> episodes,
+  ) async {
     if (_server == null || _apiKey == null) {
       throw Exception('Not authenticated');
     }
@@ -2405,7 +2451,11 @@ class PinepodsService {
       final response = await _post(
         url,
         headers: {'Api-Key': _apiKey!, 'Content-Type': 'application/json'},
-        body: jsonEncode({'episode_ids': episodeIds}),
+        body: jsonEncode({
+          'episodes': episodes
+              .map((e) => {'episode_id': e.episodeId, 'is_youtube': e.isYoutube})
+              .toList(),
+        }),
       );
 
       _devLog(

@@ -654,17 +654,76 @@ pub async fn queue_episode(
         return Err(AppError::forbidden("You can only queue episodes for yourself!"));
     }
 
+    // Insert under the currently-playing episode ("play next"). Prefer the client's
+    // own hint (instant local accuracy); if it didn't send one, fall back to the
+    // user's active session anchor — what any of their devices is currently playing
+    // — so a device that reports its now-playing (but can't name it at add time,
+    // e.g. mobile) still gets correct "play next" placement. Otherwise, top.
+    let placement = match request.playing_episode_id {
+        Some(playing_episode_id) => crate::database::QueuePlacement::Under {
+            playing_episode_id,
+            playing_is_youtube: request.playing_is_youtube.unwrap_or(false),
+        },
+        None => match state.redis_client.active_session_anchor(request.user_id).await {
+            Ok(Some((anchor_id, anchor_is_youtube))) => crate::database::QueuePlacement::Under {
+                playing_episode_id: anchor_id,
+                playing_is_youtube: anchor_is_youtube,
+            },
+            _ => crate::database::QueuePlacement::Top,
+        },
+    };
+
     // Queue the episode
-    state.db_pool.queue_episode(request.episode_id, request.user_id, request.is_youtube).await?;
-    
+    state.db_pool.queue_episode(request.episode_id, request.user_id, request.is_youtube, placement).await?;
+
     let message = if request.is_youtube {
         "Video queued successfully"
     } else {
         "Episode queued successfully"
     };
-    
+
     Ok(Json(crate::models::QueueResponse {
         data: message.to_string(),
+    }))
+}
+
+// Move a queued episode to the top of the queue (position 1), inserting it if it
+// isn't queued yet. Called when a device starts playing so the currently-playing
+// episode is always the queue anchor.
+#[utoipa::path(
+    post,
+    path = "/queue_bump",
+    tag = "podcasts",
+    summary = "Move an episode to the top of the queue",
+    request_body = crate::models::QueuePodcastRequest,
+    security(("api_key" = [])),
+    responses(
+        (status = 200, description = "Success", body = crate::models::QueueResponse),
+        (status = 401, description = "Invalid or missing API key"),
+    ),
+)]
+pub async fn queue_episode_to_top(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(request): Json<crate::models::QueuePodcastRequest>,
+) -> Result<Json<crate::models::QueueResponse>, AppError> {
+    let api_key = extract_api_key(&headers)?;
+
+    let is_valid = state.db_pool.verify_api_key(&api_key).await?;
+    if !is_valid {
+        return Err(AppError::unauthorized("Invalid API key"));
+    }
+
+    if !check_user_access(&state, &api_key, request.user_id).await? {
+        return Err(AppError::forbidden("You can only queue episodes for yourself!"));
+    }
+
+    state.db_pool
+        .move_queue_episode_to_top(request.episode_id, request.user_id, request.is_youtube)
+        .await?;
+
+    Ok(Json(crate::models::QueueResponse {
+        data: "Episode moved to top of queue".to_string(),
     }))
 }
 
@@ -811,9 +870,20 @@ pub async fn reorder_queue(
         return Err(AppError::forbidden("You can only reorder your own queue!"));
     }
 
+    // Prefer the type-aware `episodes` list (carries is_youtube so podcast/YouTube
+    // ids can't collide); fall back to the legacy id-only list for older clients.
+    let items: Vec<(i32, Option<bool>)> = match (request.episodes, request.episode_ids) {
+        (Some(episodes), _) => episodes
+            .into_iter()
+            .map(|e| (e.episode_id, Some(e.is_youtube)))
+            .collect(),
+        (None, Some(ids)) => ids.into_iter().map(|id| (id, None)).collect(),
+        (None, None) => Vec::new(),
+    };
+
     // Reorder the queue
-    state.db_pool.reorder_queue(query.user_id, request.episode_ids).await?;
-    
+    state.db_pool.reorder_queue(query.user_id, items).await?;
+
     Ok(Json(crate::models::ReorderQueueResponse {
         message: "Queue reordered successfully".to_string(),
     }))
@@ -3170,8 +3240,11 @@ pub async fn remove_youtube_channel(
 #[derive(Deserialize, utoipa::IntoParams)]
 pub struct StreamQuery {
     pub api_key: String,
+    // `amp;user_id` / `amp;type` aliases tolerate RSS stream URLs pasted raw (un-decoded)
+    // from feed XML, where the mandatory `&amp;` entity mangles later param names (issue #927).
+    #[serde(alias = "amp;user_id")]
     pub user_id: i32,
-    #[serde(rename = "type")]
+    #[serde(rename = "type", alias = "amp;type")]
     pub source_type: Option<String>,
 }
 

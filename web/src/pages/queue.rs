@@ -443,9 +443,15 @@ pub fn virtual_queue_list(props: &VirtualQueueListProps) -> Html {
 
                             web_sys::console::log_1(&"Calling reorder queue API".into());
 
-                            // Extract episode IDs
-                            let episode_ids: Vec<i32> =
-                                episodes_vec.iter().map(|ep| ep.episodeid).collect();
+                            // Extract queue items, keeping is_youtube so podcast and
+                            // YouTube ids that collide are repositioned correctly.
+                            let reorder_items: Vec<pod_req::ReorderQueueItem> = episodes_vec
+                                .iter()
+                                .map(|ep| pod_req::ReorderQueueItem {
+                                    episode_id: ep.episodeid,
+                                    is_youtube: ep.is_youtube,
+                                })
+                                .collect();
 
                             dispatch.reduce_mut(|state| {
                                 state.queued_episodes = Some(QueuedEpisodesResponse {
@@ -462,7 +468,7 @@ pub fn virtual_queue_list(props: &VirtualQueueListProps) -> Html {
                                     &server_name.unwrap(),
                                     &api_key.unwrap(),
                                     &user_id.unwrap(),
-                                    &episode_ids,
+                                    reorder_items,
                                 )
                                 .await
                                 {

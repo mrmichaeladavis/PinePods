@@ -58,7 +58,7 @@ impl PodcastEpisodeState {
 #[function_component(Downloads)]
 pub fn downloads() -> Html {
     let (i18n, _) = use_translation();
-    let (_state, dispatch) = use_store::<AppState>();
+    let (state, dispatch) = use_store::<AppState>();
     let expanded_state: UseStateHandle<HashMap<i32, bool>> = use_state(HashMap::new);
     let per_podcast_state: UseStateHandle<HashMap<i32, PodcastEpisodeState>> = use_state(HashMap::new);
     let podcast_summaries: UseStateHandle<Vec<PodcastDownloadSummary>> = use_state(Vec::new);
@@ -79,6 +79,15 @@ pub fn downloads() -> Html {
     let i18n_no_episode_downloads_found =
         i18n.t("downloads.no_episode_downloads_found").to_string();
     let i18n_load_more = i18n.t("downloads.load_more").to_string();
+    let i18n_confirm_delete_title = i18n.t("downloads.confirm_delete_title").to_string();
+
+    // Number of episodes currently selected for bulk deletion (drives the
+    // confirmation modal copy).
+    let selected_count = state.selected_episodes_for_deletion.len();
+    let i18n_confirm_delete_message = i18n
+        .t("downloads.confirm_delete_message")
+        .replace("{count}", &selected_count.to_string())
+        .replace("{plural}", if selected_count == 1 { "" } else { "s" });
 
     let episode_search_term = use_state(|| String::new());
     // Debounced view of episode_search_term. Keystrokes update episode_search_term immediately
@@ -235,6 +244,7 @@ pub fn downloads() -> Html {
     enum PageState {
         Delete,
         Normal,
+        Confirm,
     }
 
     let delete_mode_enable = {
@@ -248,6 +258,27 @@ pub fn downloads() -> Html {
         let page_state = page_state.clone();
         Callback::from(move |_: MouseEvent| {
             page_state.set(PageState::Normal);
+        })
+    };
+
+    // Open the confirmation modal when the trash button is pressed. No-op when
+    // nothing is selected so we don't show an empty confirmation.
+    let open_confirm_delete = {
+        let page_state = page_state.clone();
+        let dispatch = dispatch.clone();
+        Callback::from(move |_: MouseEvent| {
+            if !dispatch.get().selected_episodes_for_deletion.is_empty() {
+                page_state.set(PageState::Confirm);
+            }
+        })
+    };
+
+    // Cancel the confirmation and return to select mode, preserving the
+    // current selection.
+    let cancel_confirm_delete = {
+        let page_state = page_state.clone();
+        Callback::from(move |_: MouseEvent| {
+            page_state.set(PageState::Delete);
         })
     };
 
@@ -271,6 +302,8 @@ pub fn downloads() -> Html {
         let api_key = api_key.clone();
         let user_id = user_id.clone();
         let per_podcast_state = per_podcast_state.clone();
+        let podcast_summaries = podcast_summaries.clone();
+        let expanded_state = expanded_state.clone();
 
         Callback::from(move |_: MouseEvent| {
             let _dispatch_cloned = dispatch.clone();
@@ -279,6 +312,8 @@ pub fn downloads() -> Html {
             let api_key_cloned = api_key.clone().unwrap();
             let user_id_cloned = user_id.unwrap();
             let per_podcast_state_cloned = per_podcast_state.clone();
+            let podcast_summaries_cloned = podcast_summaries.clone();
+            let expanded_state_cloned = expanded_state.clone();
 
             dispatch.reduce_mut(move |state| {
                 let selected_episode_ids: Vec<i32> = state
@@ -306,17 +341,57 @@ pub fn downloads() -> Html {
                         .await
                         {
                             Ok(success_message) => {
-                                // Remove deleted episodes from per-podcast state
+                                // Remove deleted episodes from per-podcast state,
+                                // tracking how many were removed from each podcast so we
+                                // can update the summary counts / drop empty podcasts.
+                                // Selections can only come from loaded (expanded)
+                                // podcasts, so every deleted episode is represented here.
+                                let mut removed_by_podcast: HashMap<i32, i64> = HashMap::new();
                                 let mut new_state = (*per_podcast_state_cloned).clone();
-                                for podcast_state in new_state.values_mut() {
-                                    podcast_state.episodes.retain(|ep| !selected_episode_ids.contains(&ep.episodeid));
-                                    podcast_state.total -= selected_episode_ids.len() as i64;
-                                    if podcast_state.total < 0 {
-                                        podcast_state.total = 0;
-                                    }
+                                for (podcast_id, podcast_state) in new_state.iter_mut() {
+                                    let removed_here = podcast_state
+                                        .episodes
+                                        .iter()
+                                        .filter(|ep| selected_episode_ids.contains(&ep.episodeid))
+                                        .count() as i64;
+                                    podcast_state
+                                        .episodes
+                                        .retain(|ep| !selected_episode_ids.contains(&ep.episodeid));
+                                    podcast_state.total = (podcast_state.total - removed_here).max(0);
                                     podcast_state.offset = podcast_state.episodes.len() as i64;
+                                    removed_by_podcast.insert(*podcast_id, removed_here);
+                                }
+                                // Drop podcasts that no longer have any downloaded episodes
+                                // so their card disappears from the list.
+                                let empty_ids: Vec<i32> = new_state
+                                    .iter()
+                                    .filter(|(_, s)| s.total <= 0)
+                                    .map(|(id, _)| *id)
+                                    .collect();
+                                for id in &empty_ids {
+                                    new_state.remove(id);
                                 }
                                 per_podcast_state_cloned.set(new_state);
+
+                                // Update the summary cards: decrement each podcast's
+                                // episode_count and drop any that reach zero.
+                                let mut new_summaries = (*podcast_summaries_cloned).clone();
+                                for summary in new_summaries.iter_mut() {
+                                    if let Some(removed) = removed_by_podcast.get(&summary.podcastid) {
+                                        summary.episode_count = (summary.episode_count - removed).max(0);
+                                    }
+                                }
+                                new_summaries.retain(|s| s.episode_count > 0);
+                                podcast_summaries_cloned.set(new_summaries);
+
+                                // Clean up expansion state for removed podcasts.
+                                if !empty_ids.is_empty() {
+                                    let mut new_expanded = (*expanded_state_cloned).clone();
+                                    for id in &empty_ids {
+                                        new_expanded.remove(id);
+                                    }
+                                    expanded_state_cloned.set(new_expanded);
+                                }
 
                                 Dispatch::<NotificationState>::global().reduce_mut(|state| {
                                     state.info_message = Some(success_message);
@@ -338,6 +413,63 @@ pub fn downloads() -> Html {
     };
 
     let is_delete_mode = **page_state.borrow() == PageState::Delete;
+
+    // Reactive removal: when a single episode is removed via its context menu ("Remove downloaded
+    // episode"), drop it from the local per-podcast state without a refetch. Mirrors the
+    // bulk-delete bookkeeping above for one id: retain across podcasts, decrement counts, and
+    // prune any podcast that hits zero downloads.
+    let on_episode_removed = {
+        let per_podcast_state = per_podcast_state.clone();
+        let podcast_summaries = podcast_summaries.clone();
+        let expanded_state = expanded_state.clone();
+        use_callback((), move |id: i32, _| {
+            let mut removed_by_podcast: HashMap<i32, i64> = HashMap::new();
+            let mut new_state = (*per_podcast_state).clone();
+            for (podcast_id, podcast_state) in new_state.iter_mut() {
+                let removed_here = podcast_state
+                    .episodes
+                    .iter()
+                    .filter(|ep| ep.episodeid == id)
+                    .count() as i64;
+                if removed_here == 0 {
+                    continue;
+                }
+                podcast_state.episodes.retain(|ep| ep.episodeid != id);
+                podcast_state.total = (podcast_state.total - removed_here).max(0);
+                podcast_state.offset = podcast_state.episodes.len() as i64;
+                removed_by_podcast.insert(*podcast_id, removed_here);
+            }
+            if removed_by_podcast.is_empty() {
+                return;
+            }
+            let empty_ids: Vec<i32> = new_state
+                .iter()
+                .filter(|(_, s)| s.total <= 0)
+                .map(|(id, _)| *id)
+                .collect();
+            for pid in &empty_ids {
+                new_state.remove(pid);
+            }
+            per_podcast_state.set(new_state);
+
+            let mut new_summaries = (*podcast_summaries).clone();
+            for summary in new_summaries.iter_mut() {
+                if let Some(removed) = removed_by_podcast.get(&summary.podcastid) {
+                    summary.episode_count = (summary.episode_count - removed).max(0);
+                }
+            }
+            new_summaries.retain(|s| s.episode_count > 0);
+            podcast_summaries.set(new_summaries);
+
+            if !empty_ids.is_empty() {
+                let mut new_expanded = (*expanded_state).clone();
+                for pid in &empty_ids {
+                    new_expanded.remove(pid);
+                }
+                expanded_state.set(new_expanded);
+            }
+        })
+    };
 
     // Toggle expand and trigger lazy-load on first expand
     let toggle_pod_expanded = {
@@ -504,7 +636,7 @@ pub fn downloads() -> Html {
                                                             <span>{&i18n_cancel}</span>
                                                         </button>
                                                         <button class="sp-chip is-alert"
-                                                            onclick={delete_selected_episodes.clone()}>
+                                                            onclick={open_confirm_delete.clone()}>
                                                             <i class="ph ph-trash"></i>
                                                             <span>{&i18n_delete}</span>
                                                         </button>
@@ -587,6 +719,43 @@ pub fn downloads() -> Html {
                     }
 
                     {
+                        if **page_state.borrow() == PageState::Confirm {
+                            html! {
+                                <div class="fixed top-0 right-0 left-0 z-50 flex justify-center items-center w-full h-[calc(100%-1rem)] max-h-full bg-black bg-opacity-25"
+                                    onclick={cancel_confirm_delete.clone()}>
+                                    <div class="modal-container relative p-4 w-full max-w-md max-h-full rounded-lg shadow"
+                                        onclick={Callback::from(|e: MouseEvent| e.stop_propagation())}>
+                                        <div class="modal-container relative rounded-lg shadow">
+                                            <div class="flex items-center justify-between p-4 md:p-5 border-b rounded-t">
+                                                <h3 class="text-xl font-semibold">
+                                                    {&i18n_confirm_delete_title}
+                                                </h3>
+                                            </div>
+                                            <div class="p-4 md:p-5">
+                                                <p class="mb-4 text-sm font-medium">
+                                                    {&i18n_confirm_delete_message}
+                                                </p>
+                                                <div class="flex justify-between space-x-4">
+                                                    <button onclick={delete_selected_episodes.clone()}
+                                                        class="mt-4 download-button font-bold py-2 px-4 rounded focus:outline-none focus:shadow-outline">
+                                                        {&i18n_delete}
+                                                    </button>
+                                                    <button onclick={cancel_confirm_delete.clone()}
+                                                        class="mt-4 download-button font-bold py-2 px-4 rounded focus:outline-none focus:shadow-outline">
+                                                        {&i18n_cancel}
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            }
+                        } else {
+                            html! {}
+                        }
+                    }
+
+                    {
                         if !podcast_summaries.is_empty() {
                             let dispatch_cloned = dispatch.clone();
 
@@ -636,6 +805,7 @@ pub fn downloads() -> Html {
                                             has_more,
                                             load_more_closure,
                                             i18n_load_more.clone(),
+                                            on_episode_removed.clone(),
                                         )
                                     }) }
                                 </>
@@ -697,6 +867,7 @@ pub struct DownloadEpisodesProps {
     pub has_more: bool,
     pub load_more: Callback<MouseEvent>,
     pub load_more_label: String,
+    pub on_episode_removed: Callback<i32>,
 }
 
 #[function_component(DownloadEpisodes)]
@@ -712,6 +883,7 @@ pub fn download_episodes(props: &DownloadEpisodesProps) -> Html {
                 page_type={PageType::Downloads}
                 is_delete_mode={props.is_delete_mode}
                 on_checkbox_change={props.on_checkbox_change.clone()}
+                on_episode_removed={props.on_episode_removed.clone()}
                 disable_sentinel={true}
                 scroll_source={ScrollSource::Container(container_ref.clone())}
             />
@@ -750,6 +922,7 @@ pub fn render_podcast_with_episodes(
     has_more: bool,
     load_more: Callback<MouseEvent>,
     load_more_label: String,
+    on_episode_removed: Callback<i32>,
 ) -> Html {
     let on_podcast_checkbox_change = {
         let on_checkbox_change = on_checkbox_change.clone();
@@ -833,6 +1006,7 @@ pub fn render_podcast_with_episodes(
                             has_more={has_more}
                             load_more={load_more.clone()}
                             load_more_label={load_more_label.clone()}
+                            on_episode_removed={on_episode_removed.clone()}
                         />
                     </div>
                 }

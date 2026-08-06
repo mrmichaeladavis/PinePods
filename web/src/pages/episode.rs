@@ -1981,10 +1981,16 @@ pub fn epsiode() -> Html {
                                 let _queue_post = dispatch_queue.clone();
                                 let queue_status = queue_status.clone();
                                 let is_queued = *queue_status;
+                                // Anchor an add under whatever is playing ("play next");
+                                // ignored by the remove branch.
+                                let (playing_episode_id, playing_is_youtube) =
+                                    crate::components::context::current_playing_anchor();
                                 let request = QueuePodcastRequest {
                                     episode_id,
                                     user_id: user_id_queue.unwrap(),
                                     is_youtube,
+                                    playing_episode_id,
+                                    playing_is_youtube,
                                 };
 
                                 let future = async move {

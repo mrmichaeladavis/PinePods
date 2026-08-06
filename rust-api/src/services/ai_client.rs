@@ -177,7 +177,13 @@ async fn post_ndjson(
     // Parse newline-delimited JSON as chunks arrive.
     let mut buf: Vec<u8> = Vec::new();
     let mut result: Option<serde_json::Value> = None;
-    while let Some(chunk) = resp.chunk().await.map_err(|e| format!("AI stream error: {}", e))? {
+    while let Some(chunk) = resp.chunk().await.map_err(|e| {
+        format!(
+            "AI service connection dropped mid-job ({}) — the pinepods-ai container likely crashed \
+             or ran out of memory (OOM). Check its logs (docker logs pinepods-ai).",
+            e
+        )
+    })? {
         buf.extend_from_slice(&chunk);
         while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
             let line: Vec<u8> = buf.drain(..=pos).collect();
@@ -206,7 +212,11 @@ async fn post_ndjson(
             }
         }
     }
-    result.ok_or_else(|| "AI returned no result".to_string())
+    result.ok_or_else(|| {
+        "AI service closed the stream before finishing — it likely crashed or ran out of memory \
+         (OOM). Check the pinepods-ai container logs (docker logs pinepods-ai)."
+            .to_string()
+    })
 }
 
 /// Request a transcription of a locally-downloaded file. `file_path` must be a path the sidecar

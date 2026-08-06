@@ -5899,6 +5899,228 @@
         ]
       }
     },
+    "/api/data/notifications": {
+      "get": {
+        "tags": [
+          "notifications"
+        ],
+        "summary": "List the user's live durable notifications (messages/alerts). Expired ones are\ndropped server-side. Powers the Activity center on load and as a WS fallback.",
+        "operationId": "list_notifications",
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The user's notifications",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/InAppNotification"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid or missing API key"
+          },
+          "403": {
+            "description": "Not authorized for this user"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/api/data/notifications/clear": {
+      "post": {
+        "tags": [
+          "notifications"
+        ],
+        "summary": "Clear all (or all read) notifications for the user.",
+        "operationId": "clear_notifications",
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          },
+          {
+            "name": "read_only",
+            "in": "query",
+            "description": "When true, only already-read notifications are removed.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Cleared"
+          },
+          "401": {
+            "description": "Invalid or missing API key"
+          },
+          "403": {
+            "description": "Not authorized for this user"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/api/data/notifications/{id}/dismiss": {
+      "post": {
+        "tags": [
+          "notifications"
+        ],
+        "summary": "Dismiss (delete) one notification.",
+        "operationId": "dismiss_notification",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "user_id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Dismissed"
+          },
+          "401": {
+            "description": "Invalid or missing API key"
+          },
+          "403": {
+            "description": "Not authorized for this user"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/api/data/notifications/{id}/read": {
+      "post": {
+        "tags": [
+          "notifications"
+        ],
+        "summary": "Mark one notification read.",
+        "operationId": "mark_notification_read",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "user_id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Marked read"
+          },
+          "401": {
+            "description": "Invalid or missing API key"
+          },
+          "403": {
+            "description": "Not authorized for this user"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/api/data/now_playing_devices": {
+      "get": {
+        "tags": [
+          "nowplaying"
+        ],
+        "summary": "List the user's active devices and what each is currently playing. Backed by\nephemeral Valkey snapshots with a TTL, so a device that stops reporting drops\noff automatically. Powers the \"see / control my other devices\" UI for clients\nthat aren't holding a live socket.",
+        "operationId": "now_playing_devices",
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Active devices and their now-playing state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NowPlayingDevicesResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid or missing API key"
+          },
+          "403": {
+            "description": "Not authorized for this user"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
     "/api/data/person/episodes/{user_id}/{person_id}": {
       "get": {
         "tags": [
@@ -7110,6 +7332,45 @@
             }
           }
         }
+      }
+    },
+    "/api/data/queue_bump": {
+      "post": {
+        "tags": [
+          "podcasts"
+        ],
+        "summary": "Move an episode to the top of the queue",
+        "operationId": "queue_episode_to_top",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/QueuePodcastRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QueueResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid or missing API key"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
       }
     },
     "/api/data/queue_pod": {
@@ -10537,6 +10798,104 @@
         ]
       }
     },
+    "/api/data/ytdlp_settings": {
+      "get": {
+        "tags": [
+          "settings"
+        ],
+        "summary": "Get yt-dlp management settings + current version (admin)",
+        "operationId": "get_ytdlp_settings",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid or missing API key"
+          },
+          "403": {
+            "description": "Admin access required"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "settings"
+        ],
+        "summary": "Update yt-dlp management settings (admin)",
+        "operationId": "update_ytdlp_settings",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/YtDlpSettingsUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid or missing API key"
+          },
+          "403": {
+            "description": "Admin access required"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/api/data/ytdlp_update": {
+      "post": {
+        "tags": [
+          "settings"
+        ],
+        "summary": "Trigger an immediate yt-dlp self-update (admin)",
+        "operationId": "trigger_ytdlp_update",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid or missing API key"
+          },
+          "403": {
+            "description": "Admin access required"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
     "/api/data/{podcast_id}/merge": {
       "post": {
         "tags": [
@@ -13515,6 +13874,83 @@
           }
         }
       },
+      "InAppNotification": {
+        "type": "object",
+        "description": "A durable, no-progress notification (\"message\"/\"alert\") shown in the Activity\ncenter's Messages / \"Needs attention\" sections. Distinct from a `TaskInfo`\n(which has progress and a lifecycle). Persisted per-user in Redis and streamed\nover the same task WebSocket. See the notification redesign plan.",
+        "required": [
+          "id",
+          "user_id",
+          "category",
+          "severity",
+          "title",
+          "created_at",
+          "expires_at"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "user_id": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "category": {
+            "type": "string",
+            "description": "Free-form category tag (e.g. \"feed_refresh\", \"ai\", \"new_episode\")."
+          },
+          "severity": {
+            "$ref": "#/components/schemas/MsgSeverity"
+          },
+          "title": {
+            "type": "string"
+          },
+          "body": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "episode_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32"
+          },
+          "podcast_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32"
+          },
+          "art_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "link": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional in-app link the message can deep-link to."
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "read": {
+            "type": "boolean"
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Server-authoritative expiry. List reads drop anything past this instant."
+          }
+        }
+      },
       "InitRequest": {
         "type": "object",
         "required": [
@@ -13688,6 +14124,16 @@
           }
         }
       },
+      "MsgSeverity": {
+        "type": "string",
+        "description": "Durable in-app notification severity. Mirrored on the frontend\n(`web/src/components/context.rs`). `warning`/`error` count toward the bell\nbadge; `info`/`success` do not.",
+        "enum": [
+          "info",
+          "success",
+          "warning",
+          "error"
+        ]
+      },
       "NextPlaylistEpisodeRequest": {
         "type": "object",
         "required": [
@@ -13831,6 +14277,74 @@
           },
           "platform": {
             "type": "string"
+          }
+        }
+      },
+      "NowPlayingDevicesResponse": {
+        "type": "object",
+        "required": [
+          "devices"
+        ],
+        "properties": {
+          "devices": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NowPlayingSnapshot"
+            }
+          }
+        }
+      },
+      "NowPlayingSnapshot": {
+        "type": "object",
+        "description": "An ephemeral snapshot of what one device is playing, mirrored into Valkey with\na TTL so other devices can see it and send remote-control commands. This is a\nbest-effort mirror, never the source of truth for playback (see the\n\"aware, not owns\" principle) — the device's local player stays authoritative.",
+        "required": [
+          "device_id",
+          "device_name",
+          "device_type",
+          "episode_id"
+        ],
+        "properties": {
+          "device_id": {
+            "type": "string"
+          },
+          "device_name": {
+            "type": "string"
+          },
+          "device_type": {
+            "type": "string"
+          },
+          "episode_id": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "is_youtube": {
+            "type": "boolean"
+          },
+          "title": {
+            "type": "string"
+          },
+          "artwork_url": {
+            "type": "string"
+          },
+          "position_sec": {
+            "type": "number",
+            "format": "double"
+          },
+          "duration_sec": {
+            "type": "number",
+            "format": "double"
+          },
+          "playing": {
+            "type": "boolean"
+          },
+          "speed": {
+            "type": "number",
+            "format": "double"
+          },
+          "updated_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix seconds when this snapshot was last updated (server-stamped on write)."
           }
         }
       },
@@ -14602,6 +15116,20 @@
           },
           "is_youtube": {
             "type": "boolean"
+          },
+          "playing_episode_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Optional hint: the episode currently playing on the caller's device, so the\nserver can insert the new episode directly *under* it (\"play next\"). When\nabsent the episode is inserted at the top of the queue. Ignored by\nremove_queued_pod. The anchor may itself be a YouTube video, hence the\ncompanion `playing_is_youtube` flag for an unambiguous lookup."
+          },
+          "playing_is_youtube": {
+            "type": [
+              "boolean",
+              "null"
+            ]
           }
         }
       },
@@ -14922,18 +15450,45 @@
           }
         }
       },
-      "ReorderQueueRequest": {
+      "ReorderQueueItem": {
         "type": "object",
+        "description": "A single queue entry in a reorder request. Carries `is_youtube` so the server\ncan disambiguate a podcast `EpisodeID` from a YouTube `VideoID` that happen to\nshare the same integer (they come from independent autoincrement sequences).",
         "required": [
-          "episode_ids"
+          "episode_id"
         ],
         "properties": {
+          "episode_id": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "is_youtube": {
+            "type": "boolean"
+          }
+        }
+      },
+      "ReorderQueueRequest": {
+        "type": "object",
+        "properties": {
+          "episodes": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/ReorderQueueItem"
+            },
+            "description": "Preferred, type-aware ordering. Element 0 becomes queue position 1 (top)."
+          },
           "episode_ids": {
-            "type": "array",
+            "type": [
+              "array",
+              "null"
+            ],
             "items": {
               "type": "integer",
               "format": "int32"
-            }
+            },
+            "description": "Legacy id-only ordering, kept for backward compatibility with older clients.\nUsed only when `episodes` is absent."
           }
         }
       },
@@ -15727,6 +16282,49 @@
               "string",
               "null"
             ]
+          },
+          "completed_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When the task reached SUCCESS/FAILED — drives \"Done\" ordering + relative time."
+          },
+          "art_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Cover art for the card thumbnail."
+          },
+          "detail": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Sub-line detail (e.g. \"72 of 128 feeds\"; on failure, the reason)."
+          },
+          "group": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Shared key folding sibling tasks into one collapsible group."
+          },
+          "group_label": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "total": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Total item count a grouped run is working through (for \"x of N\")."
           }
         }
       },
@@ -16468,6 +17066,22 @@
             "type": "string"
           }
         }
+      },
+      "YtDlpSettingsUpdate": {
+        "type": "object",
+        "description": "Update payload from the settings page (only the two user-editable fields).",
+        "required": [
+          "auto_update",
+          "channel"
+        ],
+        "properties": {
+          "auto_update": {
+            "type": "boolean"
+          },
+          "channel": {
+            "type": "string"
+          }
+        }
       }
     },
     "securitySchemes": {
@@ -16510,6 +17124,10 @@
     {
       "name": "tasks",
       "description": "Background tasks and progress"
+    },
+    {
+      "name": "notifications",
+      "description": "Durable in-app notifications (Activity center)"
     },
     {
       "name": "feed",

@@ -212,11 +212,54 @@ pub struct QueuePodcastRequest {
     pub episode_id: i32,
     pub user_id: i32,
     pub is_youtube: bool,
+    /// Optional hint: the episode currently playing on the caller's device, so the
+    /// server can insert the new episode directly *under* it ("play next"). When
+    /// absent the episode is inserted at the top of the queue. Ignored by
+    /// remove_queued_pod. The anchor may itself be a YouTube video, hence the
+    /// companion `playing_is_youtube` flag for an unambiguous lookup.
+    #[serde(default)]
+    pub playing_episode_id: Option<i32>,
+    #[serde(default)]
+    pub playing_is_youtube: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct ClearQueueRequest {
     pub user_id: i32,
+}
+
+/// An ephemeral snapshot of what one device is playing, mirrored into Valkey with
+/// a TTL so other devices can see it and send remote-control commands. This is a
+/// best-effort mirror, never the source of truth for playback (see the
+/// "aware, not owns" principle) — the device's local player stays authoritative.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct NowPlayingSnapshot {
+    pub device_id: String,
+    pub device_name: String,
+    pub device_type: String,
+    pub episode_id: i32,
+    #[serde(default)]
+    pub is_youtube: bool,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub artwork_url: String,
+    #[serde(default)]
+    pub position_sec: f64,
+    #[serde(default)]
+    pub duration_sec: f64,
+    #[serde(default)]
+    pub playing: bool,
+    #[serde(default)]
+    pub speed: f64,
+    /// Unix seconds when this snapshot was last updated (server-stamped on write).
+    #[serde(default)]
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct NowPlayingDevicesResponse {
+    pub devices: Vec<NowPlayingSnapshot>,
 }
 
 // Saved episodes models
@@ -430,9 +473,25 @@ pub struct QueuedEpisodesResponse {
     pub data: Vec<QueuedEpisode>,
 }
 
+/// A single queue entry in a reorder request. Carries `is_youtube` so the server
+/// can disambiguate a podcast `EpisodeID` from a YouTube `VideoID` that happen to
+/// share the same integer (they come from independent autoincrement sequences).
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct ReorderQueueItem {
+    pub episode_id: i32,
+    #[serde(default)]
+    pub is_youtube: bool,
+}
+
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct ReorderQueueRequest {
-    pub episode_ids: Vec<i32>,
+    /// Preferred, type-aware ordering. Element 0 becomes queue position 1 (top).
+    #[serde(default)]
+    pub episodes: Option<Vec<ReorderQueueItem>>,
+    /// Legacy id-only ordering, kept for backward compatibility with older clients.
+    /// Used only when `episodes` is absent.
+    #[serde(default)]
+    pub episode_ids: Option<Vec<i32>>,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]

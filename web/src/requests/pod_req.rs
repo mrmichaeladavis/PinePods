@@ -718,6 +718,13 @@ pub struct QueuePodcastRequest {
     pub episode_id: i32,
     pub user_id: i32,
     pub is_youtube: bool,
+    /// The episode currently playing on this device, so the server can insert the
+    /// new episode directly under it ("play next"). `None` inserts at the top.
+    /// Ignored by the remove endpoint; skipped from the payload when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub playing_episode_id: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub playing_is_youtube: Option<bool>,
 }
 
 // Define a struct to match the response JSON structure
@@ -764,6 +771,46 @@ pub async fn call_queue_episode(
             } else {
                 "episode"
             },
+            response.status_text(),
+            error_text
+        )))
+    }
+}
+
+/// Move an episode to the top of the queue (position 1), inserting it if not
+/// already queued. Used on play so the currently-playing episode is the anchor.
+pub async fn call_move_queue_episode_to_top(
+    server_name: &String,
+    api_key: &Option<String>,
+    request_data: &QueuePodcastRequest,
+) -> Result<String, Error> {
+    let url = format!("{}/api/data/queue_bump", server_name);
+    let api_key_ref = api_key
+        .as_deref()
+        .ok_or_else(|| anyhow::Error::msg("API key is missing"))?;
+
+    let request_body = serde_json::to_string(request_data)
+        .map_err(|e| anyhow::Error::msg(format!("Serialization Error: {}", e)))?;
+
+    let response = Request::post(&url)
+        .header("Api-Key", api_key_ref)
+        .header("Content-Type", "application/json")
+        .body(request_body)?
+        .send()
+        .await?;
+
+    if response.ok() {
+        cache::invalidate_prefix(&format!("{}/api/data/get_queued_episodes", server_name));
+        let response_body: QueueResponse =
+            response.json().await.map_err(|e| anyhow::Error::new(e))?;
+        Ok(response_body.data)
+    } else {
+        let error_text = response
+            .text()
+            .await
+            .unwrap_or_else(|_| String::from("Failed to read error message"));
+        Err(anyhow::Error::msg(format!(
+            "Failed to move episode to top of queue: {} - {}",
             response.status_text(),
             error_text
         )))
@@ -896,10 +943,18 @@ pub async fn call_get_queued_episodes(
     Ok(response_data.data)
 }
 
+/// A single queue entry in a reorder request, carrying `is_youtube` so the server
+/// can disambiguate a podcast episode id from a YouTube video id that collide.
+#[derive(Serialize)]
+pub struct ReorderQueueItem {
+    pub episode_id: i32,
+    pub is_youtube: bool,
+}
+
 #[derive(Serialize)]
 #[allow(dead_code)]
 struct ReorderPayload {
-    episode_ids: Vec<i32>,
+    episodes: Vec<ReorderQueueItem>,
 }
 
 #[allow(dead_code)]
@@ -907,7 +962,7 @@ pub async fn call_reorder_queue(
     server_name: &str,
     api_key: &Option<String>,
     user_id: &i32,
-    episode_ids: &Vec<i32>,
+    episodes: Vec<ReorderQueueItem>,
 ) -> Result<(), Error> {
     // Build the URL
     let url = format!("{}/api/data/reorder_queue?user_id={}", server_name, user_id);
@@ -918,9 +973,7 @@ pub async fn call_reorder_queue(
         .ok_or_else(|| anyhow::Error::msg("API key is missing"))?;
 
     // Create the payload
-    let payload = ReorderPayload {
-        episode_ids: episode_ids.clone(),
-    };
+    let payload = ReorderPayload { episodes };
 
     // Send the request
     let response = Request::post(&url)
@@ -1585,7 +1638,7 @@ pub async fn call_get_episode_metadata(
 
     if !response.ok() {
         return Err(anyhow::Error::msg(format!(
-            "Failed to episode downloads: {}",
+            "Failed to fetch episode metadata: {}",
             response.status_text()
         )));
     }
@@ -3894,6 +3947,112 @@ pub async fn call_update_ai_settings(
     }
 }
 
+// ---- yt-dlp management (admin, #793) ----
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct YtDlpSettings {
+    #[serde(default)]
+    pub auto_update: bool,
+    #[serde(default)]
+    pub channel: String,
+    #[serde(default)]
+    pub last_updated: Option<String>,
+    #[serde(default)]
+    pub last_result: Option<String>,
+}
+
+#[derive(Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct YtDlpSettingsResponse {
+    #[serde(default)]
+    pub settings: YtDlpSettings,
+    #[serde(default)]
+    pub version: Option<String>,
+}
+
+pub async fn call_get_ytdlp_settings(
+    server_name: &str,
+    api_key: &Option<String>,
+) -> Result<YtDlpSettingsResponse, Error> {
+    let url = format!("{}/api/data/ytdlp_settings", server_name);
+    let api_key_ref = api_key
+        .as_deref()
+        .ok_or_else(|| anyhow::Error::msg("API key is missing"))?;
+    let response = Request::get(&url).header("Api-Key", api_key_ref).send().await?;
+    if response.ok() {
+        let data: YtDlpSettingsResponse = response.json().await?;
+        Ok(data)
+    } else {
+        let error_text = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Failed to read error message".to_string());
+        Err(Error::msg(format!("Failed to get yt-dlp settings: {}", error_text)))
+    }
+}
+
+#[derive(Serialize, Debug, Default)]
+pub struct YtDlpSettingsUpdate {
+    pub auto_update: bool,
+    pub channel: String,
+}
+
+pub async fn call_update_ytdlp_settings(
+    server_name: &str,
+    api_key: &Option<String>,
+    update: &YtDlpSettingsUpdate,
+) -> Result<(), Error> {
+    let url = format!("{}/api/data/ytdlp_settings", server_name);
+    let api_key_ref = api_key
+        .as_deref()
+        .ok_or_else(|| anyhow::Error::msg("API key is missing"))?;
+    let response = Request::post(&url)
+        .header("Content-Type", "application/json")
+        .header("Api-Key", api_key_ref)
+        .body(serde_json::to_string(update)?)?
+        .send()
+        .await?;
+    if response.ok() {
+        Ok(())
+    } else {
+        let error_text = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Failed to read error message".to_string());
+        Err(Error::msg(format!("Failed to update yt-dlp settings: {}", error_text)))
+    }
+}
+
+#[derive(Deserialize, Clone, Debug, Default)]
+pub struct YtDlpUpdateResult {
+    #[serde(default)]
+    pub success: bool,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub detail: String,
+}
+
+pub async fn call_trigger_ytdlp_update(
+    server_name: &str,
+    api_key: &Option<String>,
+) -> Result<YtDlpUpdateResult, Error> {
+    let url = format!("{}/api/data/ytdlp_update", server_name);
+    let api_key_ref = api_key
+        .as_deref()
+        .ok_or_else(|| anyhow::Error::msg("API key is missing"))?;
+    let response = Request::post(&url).header("Api-Key", api_key_ref).send().await?;
+    if response.ok() {
+        let data: YtDlpUpdateResult = response.json().await?;
+        Ok(data)
+    } else {
+        let error_text = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Failed to read error message".to_string());
+        Err(Error::msg(format!("Failed to trigger yt-dlp update: {}", error_text)))
+    }
+}
+
 #[derive(Deserialize, Clone, Debug, PartialEq, Default)]
 pub struct AiModels {
     #[serde(default)]
@@ -4159,6 +4318,11 @@ pub async fn connect_to_episode_websocket(
                     details
                 }),
                 completion_time: None,
+                art_url: None,
+                detail: None,
+                group: None,
+                group_label: None,
+                total: None,
             };
 
             // Check if there's already a feed refresh task and remove it
