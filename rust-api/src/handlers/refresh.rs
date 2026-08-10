@@ -246,7 +246,14 @@ async fn queue_auto_new_episodes(
     for episode in ordered {
         match state
             .db_pool
-            .queue_episode(episode.episodeid, user_id, episode.is_youtube)
+            // Auto-queued feed episodes append to the bottom (chronological build-up),
+            // unlike user-initiated adds which go to the top / under the playing item.
+            .queue_episode(
+                episode.episodeid,
+                user_id,
+                episode.is_youtube,
+                crate::database::QueuePlacement::Bottom,
+            )
             .await
         {
             Ok(()) => debug!("Auto-queued episode {} for user {}", episode.episodeid, user_id),

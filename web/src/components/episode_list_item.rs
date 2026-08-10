@@ -58,6 +58,16 @@ pub struct EpisodeListItemProps {
     pub on_select_above: Callback<i32>,
     #[prop_or_default]
     pub on_select_below: Callback<i32>,
+    /// Forwarded to [`ContextMenuButton`]: emitted (with the episode id) when this episode is
+    /// removed from the currently-shown list, so the parent page drops it from its local `Vec`.
+    #[prop_or_default]
+    pub on_episode_removed: Callback<i32>,
+    /// Forwarded to [`ContextMenuButton`]: the collection currently being viewed (Saved page).
+    #[prop_or(None)]
+    pub active_collection_id: Option<i32>,
+    /// Forwarded to [`ContextMenuButton`]: whether the active collection is the default Saved bucket.
+    #[prop_or(false)]
+    pub active_collection_is_default: bool,
 }
 
 #[function_component(EpisodeListItem)]
@@ -534,7 +544,13 @@ pub fn episode_list_item(props: &EpisodeListItemProps) -> Html {
                         </button>
                         if can_use_context_menu {
                             <div ref={context_button_ref.clone()}>
-                                <ContextMenuButton episode={props.episode.clone()} page_type={props.page_type.clone()} />
+                                <ContextMenuButton
+                                    episode={props.episode.clone()}
+                                    page_type={props.page_type.clone()}
+                                    on_episode_removed={props.on_episode_removed.clone()}
+                                    active_collection_id={props.active_collection_id}
+                                    active_collection_is_default={props.active_collection_is_default}
+                                />
                             </div>
                         }
                     </div>
@@ -550,6 +566,9 @@ pub fn episode_list_item(props: &EpisodeListItemProps) -> Html {
                             show_menu_only={true}
                             position={Some(*context_menu_position)}
                             on_close={close_context_menu.clone()}
+                            on_episode_removed={props.on_episode_removed.clone()}
+                            active_collection_id={props.active_collection_id}
+                            active_collection_is_default={props.active_collection_is_default}
                         />
                     }
                 } else {

@@ -21,6 +21,27 @@ pub enum DatabasePool {
     MySQL(Pool<MySql>),
 }
 
+/// Where a newly-queued episode should land in a user's queue.
+///
+/// The queue is a "now playing + up next" list ordered by `queueposition` ASC
+/// (position 1 = top = plays next). User-initiated adds go to the top or directly
+/// under the currently-playing episode ("play next"); automated adds (feed refresh)
+/// still append to the bottom to preserve chronological build-up.
+#[derive(Debug, Clone, Copy)]
+pub enum QueuePlacement {
+    /// Insert at position 1 (top). Used when nothing is playing.
+    Top,
+    /// Append at MAX(position)+1 (bottom). Used by auto-queue-on-refresh.
+    Bottom,
+    /// Insert directly under the given currently-playing anchor. Falls back to
+    /// `Top` when the anchor isn't in the queue. The anchor's `is_youtube` is
+    /// required for an unambiguous lookup (podcast/YouTube ids can collide).
+    Under {
+        playing_episode_id: i32,
+        playing_is_youtube: bool,
+    },
+}
+
 // A single enabled scheduled-backup row, used by the background scheduler to decide
 // when a backup is due. retention_count: None/0 = keep all backups.
 #[derive(Debug, Clone)]
@@ -2053,16 +2074,28 @@ impl DatabasePool {
     }
 
     // Queue episode - matches Python queue_pod function
-    pub async fn queue_episode(&self, episode_id: i32, user_id: i32, is_youtube: bool) -> AppResult<()> {
+    /// Add an episode to a user's queue at the requested placement.
+    ///
+    /// `placement` controls where the new row lands: `Top` (position 1), `Bottom`
+    /// (MAX+1, used by auto-queue-on-refresh), or `Under` the currently-playing
+    /// anchor ("play next"). Existing rows at/after the insert position are shifted
+    /// down by one to make room. Already-queued episodes are a no-op (not moved).
+    pub async fn queue_episode(
+        &self,
+        episode_id: i32,
+        user_id: i32,
+        is_youtube: bool,
+        placement: QueuePlacement,
+    ) -> AppResult<()> {
         match self {
             DatabasePool::Postgres(pool) => {
                 // First check if already queued
                 let existing = sqlx::query(
-                    r#"SELECT queueid FROM "EpisodeQueue" 
+                    r#"SELECT queueid FROM "EpisodeQueue"
                        WHERE episodeid = $1 AND userid = $2 AND is_youtube = $3"#
                 )
                 .bind(episode_id)
-                .bind(user_id) 
+                .bind(user_id)
                 .bind(is_youtube)
                 .fetch_optional(pool)
                 .await?;
@@ -2071,35 +2104,67 @@ impl DatabasePool {
                     return Ok(()); // Already queued, don't duplicate
                 }
 
-                // Get max queue position for user
-                let max_pos_row = sqlx::query(
-                    r#"SELECT COALESCE(MAX(queueposition), 0) as max_pos FROM "EpisodeQueue" WHERE userid = $1"#
+                let mut tx = pool.begin().await?;
+
+                // Resolve the target position for this placement.
+                let insert_pos: i32 = match placement {
+                    QueuePlacement::Top => 1,
+                    QueuePlacement::Bottom => {
+                        let max_pos: i32 = sqlx::query(
+                            r#"SELECT COALESCE(MAX(queueposition), 0) as max_pos FROM "EpisodeQueue" WHERE userid = $1"#
+                        )
+                        .bind(user_id)
+                        .fetch_one(&mut *tx)
+                        .await?
+                        .try_get("max_pos")?;
+                        max_pos + 1
+                    }
+                    QueuePlacement::Under { playing_episode_id, playing_is_youtube } => {
+                        let anchor: Option<i32> = sqlx::query(
+                            r#"SELECT queueposition FROM "EpisodeQueue"
+                               WHERE episodeid = $1 AND userid = $2 AND is_youtube = $3"#
+                        )
+                        .bind(playing_episode_id)
+                        .bind(user_id)
+                        .bind(playing_is_youtube)
+                        .fetch_optional(&mut *tx)
+                        .await?
+                        .map(|row| row.try_get("queueposition"))
+                        .transpose()?;
+                        // Under the anchor, or top if the anchor isn't queued.
+                        anchor.map(|p| p + 1).unwrap_or(1)
+                    }
+                };
+
+                // Make room: shift everything at/after the insert position down by one.
+                sqlx::query(
+                    r#"UPDATE "EpisodeQueue" SET queueposition = queueposition + 1
+                       WHERE userid = $1 AND queueposition >= $2"#
                 )
                 .bind(user_id)
-                .fetch_one(pool)
+                .bind(insert_pos)
+                .execute(&mut *tx)
                 .await?;
-                
-                let max_pos: i32 = max_pos_row.try_get("max_pos")?;
-                let new_position = max_pos + 1;
 
                 // Insert new queued episode
                 sqlx::query(
-                    r#"INSERT INTO "EpisodeQueue" (episodeid, userid, queueposition, is_youtube) 
+                    r#"INSERT INTO "EpisodeQueue" (episodeid, userid, queueposition, is_youtube)
                        VALUES ($1, $2, $3, $4)"#
                 )
                 .bind(episode_id)
                 .bind(user_id)
-                .bind(new_position)
+                .bind(insert_pos)
                 .bind(is_youtube)
-                .execute(pool)
+                .execute(&mut *tx)
                 .await?;
 
+                tx.commit().await?;
                 Ok(())
             }
             DatabasePool::MySQL(pool) => {
                 // First check if already queued
                 let existing = sqlx::query(
-                    "SELECT QueueID FROM EpisodeQueue 
+                    "SELECT QueueID FROM EpisodeQueue
                      WHERE EpisodeID = ? AND UserID = ? AND is_youtube = ?"
                 )
                 .bind(episode_id)
@@ -2112,29 +2177,194 @@ impl DatabasePool {
                     return Ok(()); // Already queued, don't duplicate
                 }
 
-                // Get max queue position for user
-                let max_pos_row = sqlx::query(
-                    "SELECT COALESCE(MAX(QueuePosition), 0) as max_pos FROM EpisodeQueue WHERE UserID = ?"
+                let mut tx = pool.begin().await?;
+
+                // Resolve the target position for this placement.
+                let insert_pos: i32 = match placement {
+                    QueuePlacement::Top => 1,
+                    QueuePlacement::Bottom => {
+                        let max_pos: i32 = sqlx::query(
+                            "SELECT COALESCE(MAX(QueuePosition), 0) as max_pos FROM EpisodeQueue WHERE UserID = ?"
+                        )
+                        .bind(user_id)
+                        .fetch_one(&mut *tx)
+                        .await?
+                        .try_get("max_pos")?;
+                        max_pos + 1
+                    }
+                    QueuePlacement::Under { playing_episode_id, playing_is_youtube } => {
+                        let anchor: Option<i32> = sqlx::query(
+                            "SELECT QueuePosition FROM EpisodeQueue
+                             WHERE EpisodeID = ? AND UserID = ? AND is_youtube = ?"
+                        )
+                        .bind(playing_episode_id)
+                        .bind(user_id)
+                        .bind(playing_is_youtube)
+                        .fetch_optional(&mut *tx)
+                        .await?
+                        .map(|row| row.try_get("QueuePosition"))
+                        .transpose()?;
+                        anchor.map(|p| p + 1).unwrap_or(1)
+                    }
+                };
+
+                // Make room: shift everything at/after the insert position down by one.
+                sqlx::query(
+                    "UPDATE EpisodeQueue SET QueuePosition = QueuePosition + 1
+                     WHERE UserID = ? AND QueuePosition >= ?"
                 )
                 .bind(user_id)
-                .fetch_one(pool)
+                .bind(insert_pos)
+                .execute(&mut *tx)
                 .await?;
-                
-                let max_pos: i32 = max_pos_row.try_get("max_pos")?;
-                let new_position = max_pos + 1;
 
                 // Insert new queued episode
                 sqlx::query(
-                    "INSERT INTO EpisodeQueue (EpisodeID, UserID, QueuePosition, is_youtube) 
+                    "INSERT INTO EpisodeQueue (EpisodeID, UserID, QueuePosition, is_youtube)
                      VALUES (?, ?, ?, ?)"
                 )
                 .bind(episode_id)
                 .bind(user_id)
-                .bind(new_position)
+                .bind(insert_pos)
                 .bind(is_youtube)
-                .execute(pool)
+                .execute(&mut *tx)
                 .await?;
 
+                tx.commit().await?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Move an episode to the top of a user's queue (position 1), or insert it there
+    /// if it isn't queued yet. Used when a device starts playing an episode so the
+    /// currently-playing item is always the queue anchor. Rows above the episode's
+    /// old position shift down by one; rows below are untouched (no gap).
+    pub async fn move_queue_episode_to_top(
+        &self,
+        episode_id: i32,
+        user_id: i32,
+        is_youtube: bool,
+    ) -> AppResult<()> {
+        match self {
+            DatabasePool::Postgres(pool) => {
+                let mut tx = pool.begin().await?;
+
+                let current_pos: Option<i32> = sqlx::query(
+                    r#"SELECT queueposition FROM "EpisodeQueue"
+                       WHERE episodeid = $1 AND userid = $2 AND is_youtube = $3"#
+                )
+                .bind(episode_id)
+                .bind(user_id)
+                .bind(is_youtube)
+                .fetch_optional(&mut *tx)
+                .await?
+                .map(|row| row.try_get("queueposition"))
+                .transpose()?;
+
+                match current_pos {
+                    Some(pos) if pos > 1 => {
+                        // Shift the block above it down, then move it to the top.
+                        sqlx::query(
+                            r#"UPDATE "EpisodeQueue" SET queueposition = queueposition + 1
+                               WHERE userid = $1 AND queueposition < $2"#
+                        )
+                        .bind(user_id)
+                        .bind(pos)
+                        .execute(&mut *tx)
+                        .await?;
+                        sqlx::query(
+                            r#"UPDATE "EpisodeQueue" SET queueposition = 1
+                               WHERE episodeid = $1 AND userid = $2 AND is_youtube = $3"#
+                        )
+                        .bind(episode_id)
+                        .bind(user_id)
+                        .bind(is_youtube)
+                        .execute(&mut *tx)
+                        .await?;
+                    }
+                    Some(_) => { /* already at position 1 — nothing to do */ }
+                    None => {
+                        // Not queued yet: make room at the top and insert.
+                        sqlx::query(
+                            r#"UPDATE "EpisodeQueue" SET queueposition = queueposition + 1
+                               WHERE userid = $1"#
+                        )
+                        .bind(user_id)
+                        .execute(&mut *tx)
+                        .await?;
+                        sqlx::query(
+                            r#"INSERT INTO "EpisodeQueue" (episodeid, userid, queueposition, is_youtube)
+                               VALUES ($1, $2, 1, $3)"#
+                        )
+                        .bind(episode_id)
+                        .bind(user_id)
+                        .bind(is_youtube)
+                        .execute(&mut *tx)
+                        .await?;
+                    }
+                }
+
+                tx.commit().await?;
+                Ok(())
+            }
+            DatabasePool::MySQL(pool) => {
+                let mut tx = pool.begin().await?;
+
+                let current_pos: Option<i32> = sqlx::query(
+                    "SELECT QueuePosition FROM EpisodeQueue
+                     WHERE EpisodeID = ? AND UserID = ? AND is_youtube = ?"
+                )
+                .bind(episode_id)
+                .bind(user_id)
+                .bind(is_youtube)
+                .fetch_optional(&mut *tx)
+                .await?
+                .map(|row| row.try_get("QueuePosition"))
+                .transpose()?;
+
+                match current_pos {
+                    Some(pos) if pos > 1 => {
+                        sqlx::query(
+                            "UPDATE EpisodeQueue SET QueuePosition = QueuePosition + 1
+                             WHERE UserID = ? AND QueuePosition < ?"
+                        )
+                        .bind(user_id)
+                        .bind(pos)
+                        .execute(&mut *tx)
+                        .await?;
+                        sqlx::query(
+                            "UPDATE EpisodeQueue SET QueuePosition = 1
+                             WHERE EpisodeID = ? AND UserID = ? AND is_youtube = ?"
+                        )
+                        .bind(episode_id)
+                        .bind(user_id)
+                        .bind(is_youtube)
+                        .execute(&mut *tx)
+                        .await?;
+                    }
+                    Some(_) => { /* already at position 1 */ }
+                    None => {
+                        sqlx::query(
+                            "UPDATE EpisodeQueue SET QueuePosition = QueuePosition + 1
+                             WHERE UserID = ?"
+                        )
+                        .bind(user_id)
+                        .execute(&mut *tx)
+                        .await?;
+                        sqlx::query(
+                            "INSERT INTO EpisodeQueue (EpisodeID, UserID, QueuePosition, is_youtube)
+                             VALUES (?, ?, 1, ?)"
+                        )
+                        .bind(episode_id)
+                        .bind(user_id)
+                        .bind(is_youtube)
+                        .execute(&mut *tx)
+                        .await?;
+                    }
+                }
+
+                tx.commit().await?;
                 Ok(())
             }
         }
@@ -2482,43 +2712,85 @@ impl DatabasePool {
     }
 
     // Reorder queue - matches Python reorder_queued_episodes function
-    pub async fn reorder_queue(&self, user_id: i32, episode_ids: Vec<i32>) -> AppResult<()> {
+    /// Rewrite a user's queue positions to `1..N` in the given order.
+    ///
+    /// Each item is `(episode_id, is_youtube)`. `is_youtube` disambiguates a podcast
+    /// `EpisodeID` from a YouTube `VideoID` that share an integer, so only the
+    /// intended row is repositioned. `None` preserves the legacy id-only match for
+    /// older clients that don't send a type discriminator.
+    pub async fn reorder_queue(
+        &self,
+        user_id: i32,
+        items: Vec<(i32, Option<bool>)>,
+    ) -> AppResult<()> {
         match self {
             DatabasePool::Postgres(pool) => {
                 let mut tx = pool.begin().await?;
-                
-                for (index, episode_id) in episode_ids.iter().enumerate() {
+
+                for (index, (episode_id, is_youtube)) in items.iter().enumerate() {
                     let new_position = (index + 1) as i32;
-                    sqlx::query(
-                        r#"UPDATE "EpisodeQueue" SET queueposition = $1 
-                           WHERE episodeid = $2 AND userid = $3"#
-                    )
-                    .bind(new_position)
-                    .bind(episode_id)
-                    .bind(user_id)
-                    .execute(&mut *tx)
-                    .await?;
+                    match is_youtube {
+                        Some(flag) => {
+                            sqlx::query(
+                                r#"UPDATE "EpisodeQueue" SET queueposition = $1
+                                   WHERE episodeid = $2 AND userid = $3 AND is_youtube = $4"#
+                            )
+                            .bind(new_position)
+                            .bind(episode_id)
+                            .bind(user_id)
+                            .bind(flag)
+                            .execute(&mut *tx)
+                            .await?;
+                        }
+                        None => {
+                            sqlx::query(
+                                r#"UPDATE "EpisodeQueue" SET queueposition = $1
+                                   WHERE episodeid = $2 AND userid = $3"#
+                            )
+                            .bind(new_position)
+                            .bind(episode_id)
+                            .bind(user_id)
+                            .execute(&mut *tx)
+                            .await?;
+                        }
+                    }
                 }
-                
+
                 tx.commit().await?;
                 Ok(())
             }
             DatabasePool::MySQL(pool) => {
                 let mut tx = pool.begin().await?;
-                
-                for (index, episode_id) in episode_ids.iter().enumerate() {
+
+                for (index, (episode_id, is_youtube)) in items.iter().enumerate() {
                     let new_position = (index + 1) as i32;
-                    sqlx::query(
-                        "UPDATE EpisodeQueue SET QueuePosition = ? 
-                         WHERE EpisodeID = ? AND UserID = ?"
-                    )
-                    .bind(new_position)
-                    .bind(episode_id)
-                    .bind(user_id)
-                    .execute(&mut *tx)
-                    .await?;
+                    match is_youtube {
+                        Some(flag) => {
+                            sqlx::query(
+                                "UPDATE EpisodeQueue SET QueuePosition = ?
+                                 WHERE EpisodeID = ? AND UserID = ? AND is_youtube = ?"
+                            )
+                            .bind(new_position)
+                            .bind(episode_id)
+                            .bind(user_id)
+                            .bind(flag)
+                            .execute(&mut *tx)
+                            .await?;
+                        }
+                        None => {
+                            sqlx::query(
+                                "UPDATE EpisodeQueue SET QueuePosition = ?
+                                 WHERE EpisodeID = ? AND UserID = ?"
+                            )
+                            .bind(new_position)
+                            .bind(episode_id)
+                            .bind(user_id)
+                            .execute(&mut *tx)
+                            .await?;
+                        }
+                    }
                 }
-                
+
                 tx.commit().await?;
                 Ok(())
             }
@@ -2755,6 +3027,12 @@ impl DatabasePool {
 
     // Mark episode as completed - matches Python mark_episode_completed function
     pub async fn mark_episode_completed(&self, episode_id: i32, user_id: i32, is_youtube: bool) -> AppResult<()> {
+        // Completing an episode also removes it from the queue (if present) so a
+        // finished item never lingers in "up next". Runs for both podcast and
+        // YouTube completions; no-op when not queued. Doing this here makes queue
+        // removal reliable regardless of which client auto-advance path fired.
+        self.remove_queued_episode(episode_id, user_id, is_youtube).await?;
+
         match self {
             DatabasePool::Postgres(pool) => {
                 if is_youtube {
@@ -9736,14 +10014,14 @@ impl DatabasePool {
                                 "YouTubeVideos".listenposition as listenduration,
                                 "YouTubeVideos".completed,
                                 CASE WHEN q.episodeid IS NOT NULL THEN true ELSE false END as is_queued,
-                                CASE WHEN s.episodeid IS NOT NULL THEN true ELSE false END as is_saved,
-                                CASE WHEN d.episodeid IS NOT NULL THEN true ELSE false END as is_downloaded,
+                                CASE WHEN s.videoid IS NOT NULL THEN true ELSE false END as is_saved,
+                                CASE WHEN d.videoid IS NOT NULL THEN true ELSE false END as is_downloaded,
                                 TRUE::boolean as is_youtube
                         FROM "YouTubeVideos"
                         INNER JOIN "Podcasts" ON "YouTubeVideos".podcastid = "Podcasts".podcastid
-                        LEFT JOIN "EpisodeQueue" q ON "YouTubeVideos".videoid = q.episodeid AND q.userid = $1
-                        LEFT JOIN "SavedEpisodes" s ON "YouTubeVideos".videoid = s.episodeid AND s.userid = $1
-                        LEFT JOIN "DownloadedEpisodes" d ON "YouTubeVideos".videoid = d.episodeid AND d.userid = $1
+                        LEFT JOIN "EpisodeQueue" q ON "YouTubeVideos".videoid = q.episodeid AND q.userid = $1 AND q.is_youtube = TRUE
+                        LEFT JOIN "SavedVideos" s ON "YouTubeVideos".videoid = s.videoid AND s.userid = $1
+                        LEFT JOIN "DownloadedVideos" d ON "YouTubeVideos".videoid = d.videoid AND d.userid = $1
                         WHERE "YouTubeVideos".videoid = $2 AND "Podcasts".userid = $1"#
                     )
                     .bind(user_id)
@@ -9920,8 +10198,158 @@ impl DatabasePool {
                 }
             }
             DatabasePool::MySQL(pool) => {
+                if is_youtube {
+                    // Query for YouTube videos — mirrors the Postgres branch. Saved/queued/
+                    // downloaded state lives in the YouTube-specific tables, keyed on VideoID.
+                    let row = sqlx::query(
+                        r#"SELECT
+                                Podcasts.PodcastID,
+                                Podcasts.PodcastIndexID,
+                                Podcasts.FeedURL,
+                                Podcasts.PodcastName,
+                                Podcasts.ArtworkURL,
+                                YouTubeVideos.VideoTitle as EpisodeTitle,
+                                YouTubeVideos.PublishedAt as EpisodePubDate,
+                                YouTubeVideos.VideoDescription as EpisodeDescription,
+                                YouTubeVideos.ThumbnailURL as EpisodeArtwork,
+                                YouTubeVideos.VideoURL as EpisodeURL,
+                                YouTubeVideos.Duration as EpisodeDuration,
+                                YouTubeVideos.VideoID as EpisodeID,
+                                YouTubeVideos.ListenPosition as ListenDuration,
+                                YouTubeVideos.Completed,
+                                CASE WHEN q.EpisodeID IS NOT NULL THEN 1 ELSE 0 END as is_queued,
+                                CASE WHEN s.VideoID IS NOT NULL THEN 1 ELSE 0 END as is_saved,
+                                CASE WHEN d.VideoID IS NOT NULL THEN 1 ELSE 0 END as is_downloaded,
+                                1 as is_youtube
+                        FROM YouTubeVideos
+                        INNER JOIN Podcasts ON YouTubeVideos.PodcastID = Podcasts.PodcastID
+                        LEFT JOIN EpisodeQueue q ON YouTubeVideos.VideoID = q.EpisodeID AND q.UserID = ? AND q.is_youtube = TRUE
+                        LEFT JOIN SavedVideos s ON YouTubeVideos.VideoID = s.VideoID AND s.UserID = ?
+                        LEFT JOIN DownloadedVideos d ON YouTubeVideos.VideoID = d.VideoID AND d.UserID = ?
+                        WHERE YouTubeVideos.VideoID = ? AND Podcasts.UserID = ?"#
+                    )
+                    .bind(user_id)
+                    .bind(user_id)
+                    .bind(user_id)
+                    .bind(episode_id)
+                    .bind(user_id)
+                    .fetch_optional(pool)
+                    .await?;
+
+                    if let Some(row) = row {
+                        let datetime = row.try_get::<sqlx::types::chrono::DateTime<sqlx::types::chrono::Utc>, _>("EpisodePubDate")?;
+
+                        return Ok(serde_json::json!({
+                            "podcastid": row.try_get::<i32, _>("PodcastID")?,
+                            "podcastindexid": row.try_get::<Option<i32>, _>("PodcastIndexID")?,
+                            "feedurl": row.try_get::<String, _>("FeedURL").unwrap_or_default(),
+                            "podcastname": row.try_get::<String, _>("PodcastName")?,
+                            "artworkurl": row.try_get::<Option<String>, _>("ArtworkURL").unwrap_or_default().unwrap_or_default(),
+                            "episodetitle": row.try_get::<String, _>("EpisodeTitle")?,
+                            "episodepubdate": datetime.to_rfc3339(),
+                            "episodedescription": row.try_get::<String, _>("EpisodeDescription")?,
+                            "episodeartwork": row.try_get::<String, _>("EpisodeArtwork")?,
+                            "episodeurl": row.try_get::<String, _>("EpisodeURL")?,
+                            "episodeduration": row.try_get::<i32, _>("EpisodeDuration")?,
+                            "episodeid": row.try_get::<i32, _>("EpisodeID")?,
+                            "listenduration": row.try_get::<Option<i32>, _>("ListenDuration")?,
+                            "completed": row.try_get::<i8, _>("Completed")? != 0,
+                            "is_queued": row.try_get::<i32, _>("is_queued")? != 0,
+                            "is_saved": row.try_get::<i32, _>("is_saved")? != 0,
+                            "is_downloaded": row.try_get::<i32, _>("is_downloaded")? != 0,
+                            "is_youtube": row.try_get::<i32, _>("is_youtube")? != 0,
+                        }));
+                    }
+                } else if person_episode {
+                    // Query for person episodes — mirrors the Postgres branch. The person-feed
+                    // row (PeopleEpisodes) is resolved to the real Episodes row (when the user is
+                    // subscribed) so status/history keys off the real episode id.
+                    let row = sqlx::query(
+                        r#"SELECT
+                            p.PodcastID,
+                            p.PodcastIndexID,
+                            p.FeedURL,
+                            p.PodcastName,
+                            p.ArtworkURL,
+                            pe.EpisodeTitle,
+                            pe.EpisodePubDate,
+                            pe.EpisodeDescription,
+                            pe.EpisodeArtwork,
+                            pe.EpisodeURL,
+                            pe.EpisodeDuration,
+                            pe.EpisodeID,
+                            COALESCE(e.EpisodeID, pe.EpisodeID) as real_episode_id,
+                            CASE WHEN q.EpisodeID IS NOT NULL THEN 1 ELSE 0 END as is_queued,
+                            CASE WHEN s.EpisodeID IS NOT NULL THEN 1 ELSE 0 END as is_saved,
+                            CASE WHEN d.EpisodeID IS NOT NULL THEN 1 ELSE 0 END as is_downloaded,
+                            0 as is_youtube
+                        FROM PeopleEpisodes pe
+                        INNER JOIN Podcasts p ON pe.PodcastID = p.PodcastID
+                        LEFT JOIN Episodes e ON (pe.EpisodeTitle = e.EpisodeTitle AND pe.EpisodeURL = e.EpisodeURL)
+                        LEFT JOIN EpisodeQueue q ON COALESCE(e.EpisodeID, pe.EpisodeID) = q.EpisodeID AND q.UserID = ?
+                        LEFT JOIN SavedEpisodes s ON COALESCE(e.EpisodeID, pe.EpisodeID) = s.EpisodeID AND s.UserID = ?
+                        LEFT JOIN DownloadedEpisodes d ON COALESCE(e.EpisodeID, pe.EpisodeID) = d.EpisodeID AND d.UserID = ?
+                        WHERE pe.EpisodeID = ?"#
+                    )
+                    .bind(user_id)
+                    .bind(user_id)
+                    .bind(user_id)
+                    .bind(episode_id)
+                    .fetch_optional(pool)
+                    .await?;
+
+                    if let Some(row) = row {
+                        let datetime = row.try_get::<sqlx::types::chrono::DateTime<sqlx::types::chrono::Utc>, _>("EpisodePubDate")?;
+                        let real_episode_id: i32 = row.try_get("real_episode_id")?;
+
+                        // Get listen history using the real episode ID
+                        let listen_history = sqlx::query(
+                            r#"SELECT UserEpisodeHistory.ListenDuration, Episodes.Completed
+                               FROM Episodes
+                               LEFT JOIN UserEpisodeHistory ON
+                                   Episodes.EpisodeID = UserEpisodeHistory.EpisodeID
+                                   AND UserEpisodeHistory.UserID = ?
+                               WHERE Episodes.EpisodeID = ?"#
+                        )
+                        .bind(user_id)
+                        .bind(real_episode_id)
+                        .fetch_optional(pool)
+                        .await?;
+
+                        let (listenduration, completed) = if let Some(history) = listen_history {
+                            (
+                                history.try_get::<Option<i32>, _>("ListenDuration")?,
+                                history.try_get::<i8, _>("Completed")? != 0
+                            )
+                        } else {
+                            (None, false)
+                        };
+
+                        return Ok(serde_json::json!({
+                            "podcastid": row.try_get::<i32, _>("PodcastID")?,
+                            "podcastindexid": row.try_get::<Option<i32>, _>("PodcastIndexID")?,
+                            "feedurl": row.try_get::<String, _>("FeedURL").unwrap_or_default(),
+                            "podcastname": row.try_get::<String, _>("PodcastName")?,
+                            "artworkurl": row.try_get::<Option<String>, _>("ArtworkURL").unwrap_or_default().unwrap_or_default(),
+                            "episodetitle": row.try_get::<String, _>("EpisodeTitle")?,
+                            "episodepubdate": datetime.to_rfc3339(),
+                            "episodedescription": row.try_get::<String, _>("EpisodeDescription")?,
+                            "episodeartwork": row.try_get::<String, _>("EpisodeArtwork")?,
+                            "episodeurl": row.try_get::<String, _>("EpisodeURL")?,
+                            "episodeduration": row.try_get::<i32, _>("EpisodeDuration")?,
+                            "episodeid": real_episode_id,
+                            "listenduration": listenduration,
+                            "completed": completed,
+                            "is_queued": row.try_get::<i32, _>("is_queued")? != 0,
+                            "is_saved": row.try_get::<i32, _>("is_saved")? != 0,
+                            "is_downloaded": row.try_get::<i32, _>("is_downloaded")? != 0,
+                            "is_youtube": row.try_get::<i32, _>("is_youtube")? != 0,
+                        }));
+                    }
+                }
+
                 let row = sqlx::query(
-                    r#"SELECT 
+                    r#"SELECT
                         Podcasts.PodcastID,
                         Podcasts.PodcastIndexID,
                         Podcasts.FeedURL,
@@ -25875,7 +26303,17 @@ impl DatabasePool {
         Ok((processed, failed))
     }
 
-    pub async fn bulk_queue_episodes(&self, episode_ids: Vec<i32>, user_id: i32, is_youtube: bool) -> AppResult<(i32, i32)> {
+    /// Bulk-add episodes to a user's queue at the requested placement, preserving
+    /// the given order. YouTube videos and podcast episodes both live in
+    /// `EpisodeQueue` (keyed by `is_youtube`) — there is no separate table. Each new
+    /// item is inserted with a shift-to-make-room so the batch stays contiguous.
+    pub async fn bulk_queue_episodes(
+        &self,
+        episode_ids: Vec<i32>,
+        user_id: i32,
+        is_youtube: bool,
+        placement: QueuePlacement,
+    ) -> AppResult<(i32, i32)> {
         if episode_ids.is_empty() {
             return Ok((0, 0));
         }
@@ -25886,138 +26324,139 @@ impl DatabasePool {
         match self {
             DatabasePool::Postgres(pool) => {
                 let mut tx = pool.begin().await?;
-                
-                if is_youtube {
-                    for episode_id in episode_ids {
-                        // Check if already queued to avoid duplicates
-                        let existing = sqlx::query(
-                            r#"SELECT "QueueID" FROM "QueuedVideos" WHERE "VideoID" = $1 AND "UserID" = $2"#
+
+                // Resolve the position the first new item should occupy.
+                let mut next_pos: i32 = match placement {
+                    QueuePlacement::Top => 1,
+                    QueuePlacement::Bottom => {
+                        let max_pos: i32 = sqlx::query(
+                            r#"SELECT COALESCE(MAX(queueposition), 0) as max_pos FROM "EpisodeQueue" WHERE userid = $1"#
                         )
-                        .bind(episode_id)
                         .bind(user_id)
-                        .fetch_optional(&mut *tx)
-                        .await?;
-                        
-                        if existing.is_none() {
-                            match sqlx::query(
-                                r#"INSERT INTO "QueuedVideos" ("VideoID", "UserID") VALUES ($1, $2)"#
-                            )
-                            .bind(episode_id)
-                            .bind(user_id)
-                            .execute(&mut *tx)
-                            .await {
-                                Ok(_) => processed += 1,
-                                Err(_) => failed += 1,
-                            }
-                        }
+                        .fetch_one(&mut *tx)
+                        .await?
+                        .try_get("max_pos")?;
+                        max_pos + 1
                     }
-                } else {
-                    // Get max queue position for user
-                    let max_pos_row = sqlx::query(
-                        r#"SELECT COALESCE(MAX(queueposition), 0) as max_pos FROM "EpisodeQueue" WHERE userid = $1"#
+                    QueuePlacement::Under { playing_episode_id, playing_is_youtube } => {
+                        let anchor: Option<i32> = sqlx::query(
+                            r#"SELECT queueposition FROM "EpisodeQueue"
+                               WHERE episodeid = $1 AND userid = $2 AND is_youtube = $3"#
+                        )
+                        .bind(playing_episode_id)
+                        .bind(user_id)
+                        .bind(playing_is_youtube)
+                        .fetch_optional(&mut *tx)
+                        .await?
+                        .map(|row| row.try_get("queueposition"))
+                        .transpose()?;
+                        anchor.map(|p| p + 1).unwrap_or(1)
+                    }
+                };
+
+                for episode_id in episode_ids {
+                    // Check if already queued to avoid duplicates
+                    let existing = sqlx::query(
+                        r#"SELECT queueid FROM "EpisodeQueue" WHERE episodeid = $1 AND userid = $2 AND is_youtube = $3"#
                     )
+                    .bind(episode_id)
                     .bind(user_id)
-                    .fetch_one(&mut *tx)
+                    .bind(is_youtube)
+                    .fetch_optional(&mut *tx)
                     .await?;
-                    
-                    let mut max_pos: i32 = max_pos_row.try_get("max_pos")?;
-                    
-                    for episode_id in episode_ids {
-                        // Check if already queued to avoid duplicates
-                        let existing = sqlx::query(
-                            r#"SELECT queueid FROM "EpisodeQueue" WHERE episodeid = $1 AND userid = $2 AND is_youtube = $3"#
+
+                    if existing.is_none() {
+                        // Make room at next_pos, then insert there.
+                        sqlx::query(
+                            r#"UPDATE "EpisodeQueue" SET queueposition = queueposition + 1
+                               WHERE userid = $1 AND queueposition >= $2"#
+                        )
+                        .bind(user_id)
+                        .bind(next_pos)
+                        .execute(&mut *tx)
+                        .await?;
+                        match sqlx::query(
+                            r#"INSERT INTO "EpisodeQueue" (episodeid, userid, queueposition, is_youtube) VALUES ($1, $2, $3, $4)"#
                         )
                         .bind(episode_id)
                         .bind(user_id)
+                        .bind(next_pos)
                         .bind(is_youtube)
-                        .fetch_optional(&mut *tx)
-                        .await?;
-                        
-                        if existing.is_none() {
-                            max_pos += 1;
-                            match sqlx::query(
-                                r#"INSERT INTO "EpisodeQueue" (episodeid, userid, queueposition, is_youtube) VALUES ($1, $2, $3, $4)"#
-                            )
-                            .bind(episode_id)
-                            .bind(user_id)
-                            .bind(max_pos)
-                            .bind(is_youtube)
-                            .execute(&mut *tx)
-                            .await {
-                                Ok(_) => processed += 1,
-                                Err(_) => failed += 1,
-                            }
+                        .execute(&mut *tx)
+                        .await {
+                            Ok(_) => { processed += 1; next_pos += 1; }
+                            Err(_) => failed += 1,
                         }
                     }
                 }
-                
+
                 tx.commit().await?;
             }
             DatabasePool::MySQL(pool) => {
                 let mut tx = pool.begin().await?;
-                
-                if is_youtube {
-                    for episode_id in episode_ids {
-                        let existing = sqlx::query(
-                            "SELECT QueueID FROM QueuedVideos WHERE VideoID = ? AND UserID = ?"
+
+                let mut next_pos: i32 = match placement {
+                    QueuePlacement::Top => 1,
+                    QueuePlacement::Bottom => {
+                        let max_pos: i32 = sqlx::query(
+                            "SELECT COALESCE(MAX(QueuePosition), 0) as max_pos FROM EpisodeQueue WHERE UserID = ?"
                         )
-                        .bind(episode_id)
                         .bind(user_id)
-                        .fetch_optional(&mut *tx)
-                        .await?;
-                        
-                        if existing.is_none() {
-                            match sqlx::query(
-                                "INSERT INTO QueuedVideos (VideoID, UserID) VALUES (?, ?)"
-                            )
-                            .bind(episode_id)
-                            .bind(user_id)
-                            .execute(&mut *tx)
-                            .await {
-                                Ok(_) => processed += 1,
-                                Err(_) => failed += 1,
-                            }
-                        }
+                        .fetch_one(&mut *tx)
+                        .await?
+                        .try_get("max_pos")?;
+                        max_pos + 1
                     }
-                } else {
-                    // Get max queue position for user
-                    let max_pos_row = sqlx::query(
-                        "SELECT COALESCE(MAX(QueuePosition), 0) as max_pos FROM EpisodeQueue WHERE UserID = ?"
+                    QueuePlacement::Under { playing_episode_id, playing_is_youtube } => {
+                        let anchor: Option<i32> = sqlx::query(
+                            "SELECT QueuePosition FROM EpisodeQueue
+                             WHERE EpisodeID = ? AND UserID = ? AND is_youtube = ?"
+                        )
+                        .bind(playing_episode_id)
+                        .bind(user_id)
+                        .bind(playing_is_youtube)
+                        .fetch_optional(&mut *tx)
+                        .await?
+                        .map(|row| row.try_get("QueuePosition"))
+                        .transpose()?;
+                        anchor.map(|p| p + 1).unwrap_or(1)
+                    }
+                };
+
+                for episode_id in episode_ids {
+                    let existing = sqlx::query(
+                        "SELECT QueueID FROM EpisodeQueue WHERE EpisodeID = ? AND UserID = ? AND is_youtube = ?"
                     )
+                    .bind(episode_id)
                     .bind(user_id)
-                    .fetch_one(&mut *tx)
+                    .bind(is_youtube)
+                    .fetch_optional(&mut *tx)
                     .await?;
-                    
-                    let mut max_pos: i32 = max_pos_row.try_get("max_pos")?;
-                    
-                    for episode_id in episode_ids {
-                        let existing = sqlx::query(
-                            "SELECT QueueID FROM EpisodeQueue WHERE EpisodeID = ? AND UserID = ? AND is_youtube = ?"
+
+                    if existing.is_none() {
+                        sqlx::query(
+                            "UPDATE EpisodeQueue SET QueuePosition = QueuePosition + 1
+                             WHERE UserID = ? AND QueuePosition >= ?"
+                        )
+                        .bind(user_id)
+                        .bind(next_pos)
+                        .execute(&mut *tx)
+                        .await?;
+                        match sqlx::query(
+                            "INSERT INTO EpisodeQueue (EpisodeID, UserID, QueuePosition, is_youtube) VALUES (?, ?, ?, ?)"
                         )
                         .bind(episode_id)
                         .bind(user_id)
+                        .bind(next_pos)
                         .bind(is_youtube)
-                        .fetch_optional(&mut *tx)
-                        .await?;
-                        
-                        if existing.is_none() {
-                            max_pos += 1;
-                            match sqlx::query(
-                                "INSERT INTO EpisodeQueue (EpisodeID, UserID, QueuePosition, is_youtube) VALUES (?, ?, ?, ?)"
-                            )
-                            .bind(episode_id)
-                            .bind(user_id)
-                            .bind(max_pos)
-                            .bind(is_youtube)
-                            .execute(&mut *tx)
-                            .await {
-                                Ok(_) => processed += 1,
-                                Err(_) => failed += 1,
-                            }
+                        .execute(&mut *tx)
+                        .await {
+                            Ok(_) => { processed += 1; next_pos += 1; }
+                            Err(_) => failed += 1,
                         }
                     }
                 }
-                
+
                 tx.commit().await?;
             }
         }

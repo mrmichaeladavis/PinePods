@@ -281,7 +281,9 @@
     "no_episode_downloads_found": "No Episode Downloads Found",
     "load_more": "Load More",
     "search_downloaded_episodes": "Search downloaded episodes...",
-    "select": "Select"
+    "select": "Select",
+    "confirm_delete_title": "Delete downloaded episodes",
+    "confirm_delete_message": "You're about to delete {count} episode{plural}. This can't be undone."
   },
   "downloads_tauri": {
     "downloaded_episodes_count": "episodes",
@@ -861,8 +863,11 @@
   },
   "notification_center": {
     "active_tasks": "Active Tasks",
+    "activity": "Activity",
     "all_tasks": "All Tasks",
+    "clear": "Clear",
     "clear_all_notifications": "Clear all notifications",
+    "clear_completed": "Clear completed",
     "dismiss_all_completed_tasks": "Dismiss all completed tasks",
     "dismiss_completed": "Dismiss Completed",
     "dismiss_error": "Dismiss error",
@@ -874,6 +879,7 @@
     "item_youtube_video": "YouTube Video",
     "no_notifications": "No notifications",
     "notifications": "Notifications",
+    "settings": "Settings",
     "show_completed": "Show completed",
     "status_completed": "Completed",
     "status_downloading": "Downloading",
@@ -1433,7 +1439,8 @@
     "yes": "Yes",
     "custom_themes": "Custom Themes",
     "transcription": "Transcription",
-    "ai": "AI"
+    "ai": "AI",
+    "ytdlp_management": "YouTube (yt-dlp)"
   },
   "shared_episode": {
     "episode_transcript": "Episode Transcript",
@@ -1491,6 +1498,14 @@
     "confirm_remove_selected": "Remove {count} episode(s) from the queue? This cannot be undone.",
     "confirm_remove": "Yes, remove",
     "applying": "Applying…"
+  },
+  "remote_devices": {
+    "other_devices": "Other devices",
+    "no_other_devices": "No other devices",
+    "no_devices_description": "Devices playing on your account will show up here to view and control.",
+    "pause": "Pause",
+    "play": "Play",
+    "play_here": "Play here"
   },
   "user_self_service": {
     "enable_user_self_service": "Enable User Self Service",
@@ -1630,6 +1645,28 @@
     "job_transcribe": "Transcription",
     "running": "Running",
     "done": "Done",
-    "failed": "Failed"
+    "failed": "Failed",
+    "section_ad_detection": "Ad detection",
+    "view_queue": "View AI job queue"
+  },
+  "ytdlp_settings": {
+    "intro": "YouTube support relies on yt-dlp, which Google's changes break regularly. The bundled binary updates itself so YouTube fixes don't have to wait for a PinePods release.",
+    "current_version": "Current version",
+    "version_unknown": "Unknown / not installed",
+    "last_update": "Last update",
+    "channel": "Update channel",
+    "channel_desc": "Nightly gets YouTube fixes fastest (usually the same day), before they reach a stable release. Stable is more conservative.",
+    "channel_stable": "Stable",
+    "channel_nightly": "Nightly",
+    "auto_update": "Automatic updates",
+    "auto_update_desc": "Check for a newer yt-dlp daily and on startup. Recommended — this is what keeps YouTube working without manual intervention.",
+    "update_now": "Update now",
+    "updating": "Updating…",
+    "saving": "Saving…",
+    "save": "Save",
+    "saved": "yt-dlp settings saved.",
+    "save_error": "Could not save yt-dlp settings",
+    "update_started": "Updating yt-dlp — this takes a few seconds.",
+    "update_error": "Could not update yt-dlp"
   }
 }

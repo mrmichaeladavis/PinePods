@@ -83,11 +83,25 @@ impl BackgroundScheduler {
             })
         })?;
 
+        // Daily yt-dlp self-update (#793). YouTube breaks whenever Google changes its internals;
+        // keeping yt-dlp current on a schedule decouples YouTube fixes from PinePods releases.
+        // Guarded by the admin auto-update toggle inside the run method.
+        let ytdlp_state = app_state.clone();
+        let ytdlp_job = Job::new_async("0 30 3 * * *", move |_uuid, _l| {
+            let state = ytdlp_state.clone();
+            Box::pin(async move {
+                if let Err(e) = Self::run_ytdlp_update(state.clone()).await {
+                    error!("❌ Scheduled yt-dlp update failed: {}", e);
+                }
+            })
+        })?;
+
         // Add jobs to scheduler
         self.scheduler.add(refresh_job).await?;
         self.scheduler.add(nightly_job).await?;
         self.scheduler.add(cleanup_job).await?;
         self.scheduler.add(backup_job).await?;
+        self.scheduler.add(ytdlp_job).await?;
 
         // Start the scheduler
         self.scheduler.start().await?;
@@ -289,6 +303,24 @@ impl BackgroundScheduler {
         }
     }
 
+    // Self-update yt-dlp to the admin-configured channel, if auto-update is enabled (#793).
+    // Shared by the daily job and the startup task.
+    async fn run_ytdlp_update(state: Arc<AppState>) -> AppResult<()> {
+        let settings = crate::services::ytdlp::get_settings(&state.db_pool)
+            .await
+            .unwrap_or_default();
+        if !settings.auto_update {
+            info!("🎬 yt-dlp auto-update is disabled; skipping");
+            return Ok(());
+        }
+        info!("🎬 Running yt-dlp self-update ({} channel)", settings.channel);
+        match crate::services::ytdlp::update_and_record(&state.db_pool).await {
+            Ok(v) => info!("✅ yt-dlp auto-update complete: {}", v),
+            Err(e) => warn!("⚠️ yt-dlp auto-update failed (keeping existing binary): {}", e),
+        }
+        Ok(())
+    }
+
     // Run initial startup tasks immediately
     pub async fn run_startup_tasks(state: Arc<AppState>) -> AppResult<()> {
         info!("🚀 Running initial startup tasks...");
@@ -306,6 +338,14 @@ impl BackgroundScheduler {
         // Strip any blank/whitespace categories left on existing podcasts
         if let Err(e) = state.db_pool.cleanup_blank_categories().await {
             warn!("⚠️ Cleaning blank podcast categories failed: {}", e);
+        }
+
+        // Log the yt-dlp version and self-update on startup (#793), so a freshly recreated
+        // container pulls the latest YouTube fix before the initial refresh runs. Runs before
+        // the refresh below because that refresh pulls YouTube feeds.
+        crate::services::ytdlp::log_version_at_startup().await;
+        if let Err(e) = Self::run_ytdlp_update(state.clone()).await {
+            warn!("⚠️ Startup yt-dlp update failed: {}", e);
         }
 
         // Run an immediate refresh to ensure data is current on startup

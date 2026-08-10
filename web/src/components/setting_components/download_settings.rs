@@ -213,7 +213,7 @@ pub fn download_settings() -> Html {
         <div class="settings-row">
             <div>
                 <div class="settings-row-label">{&i18n_folder_cover_label}</div>
-                <div class="settings-row-description">{&i18n_folder_cover_description}</div>
+                <div class="settings-row-desc">{&i18n_folder_cover_description}</div>
             </div>
             <div class="settings-row-control">
                 <label class="toggle">
@@ -228,7 +228,7 @@ pub fn download_settings() -> Html {
         <div class="settings-row">
             <div>
                 <div class="settings-row-label">{&i18n_episode_cover_label}</div>
-                <div class="settings-row-description">{&i18n_episode_cover_description}</div>
+                <div class="settings-row-desc">{&i18n_episode_cover_description}</div>
             </div>
             <div class="settings-row-control">
                 <label class="toggle">
@@ -243,7 +243,7 @@ pub fn download_settings() -> Html {
         <div class="settings-row">
             <div>
                 <div class="settings-row-label">{&i18n_metadata_sidecar_label}</div>
-                <div class="settings-row-description">{&i18n_metadata_sidecar_description}</div>
+                <div class="settings-row-desc">{&i18n_metadata_sidecar_description}</div>
             </div>
             <div class="settings-row-control">
                 <label class="toggle">

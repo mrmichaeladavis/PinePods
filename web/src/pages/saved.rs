@@ -1,6 +1,6 @@
 use crate::components::app_drawer::App_drawer;
 use crate::components::audio_player_bar::AudioPlayerBar;
-use crate::components::context::{AppState, EpisodeStatusState, FilterState, NotificationState, PodcastFeedState};
+use crate::components::context::{AppState, CollectionModalState, EpisodeStatusState, FilterState, NotificationState, PodcastFeedState};
 use crate::components::context_menu_button::PageType;
 use crate::components::episode_list_view::EpisodeListView;
 use crate::components::gen_components::{
@@ -514,6 +514,50 @@ pub fn saved() -> Html {
         })
     };
 
+    // Reactive removal: when a card is removed from the currently-shown collection (default Saved
+    // tab or the active custom collection), drop it from the local list without a refetch.
+    let on_episode_removed = {
+        let episodes = episodes.clone();
+        let total = total.clone();
+        let offset = offset.clone();
+        use_callback((), move |id: i32, _| {
+            let before = (*episodes).len();
+            let filtered: Vec<Episode> =
+                (*episodes).iter().filter(|e| e.episodeid != id).cloned().collect();
+            let removed = before - filtered.len();
+            if removed > 0 {
+                episodes.set(Rc::new(filtered));
+                total.set((*total - removed as i64).max(0));
+                offset.set((*offset - removed as i64).max(0));
+            }
+        })
+    };
+
+    // The global "Add to Collection" picker modal is a decoupled overlay, so it can't call the
+    // per-page removal callback directly. Instead it broadcasts each collection removal via
+    // CollectionModalState.last_removed; when the removed collection is the one this tab is
+    // showing, reuse the same local-list filter (the nonce guards against re-processing).
+    let modal_removed = use_selector(|s: &CollectionModalState| s.last_removed);
+    let last_modal_nonce = use_state(|| 0u32);
+    {
+        let on_episode_removed = on_episode_removed.clone();
+        let last_modal_nonce = last_modal_nonce.clone();
+        use_effect_with(
+            (*modal_removed, active_collection_id),
+            move |(sig, active_id)| {
+                if let Some((ep_id, col_id, nonce)) = *sig {
+                    if nonce != *last_modal_nonce {
+                        last_modal_nonce.set(nonce);
+                        if Some(col_id) == *active_id {
+                            on_episode_removed.emit(ep_id);
+                        }
+                    }
+                }
+                || ()
+            },
+        );
+    }
+
     // Client-side filter (search + favorites)
     let search_term = (*episode_search_term).clone();
     let has_client_filter = !search_term.is_empty()
@@ -881,6 +925,9 @@ pub fn saved() -> Html {
                                                 loading_more={*loading_more}
                                                 on_load_more={on_load_more.clone()}
                                                 page_type={PageType::Saved}
+                                                on_episode_removed={on_episode_removed.clone()}
+                                                active_collection_id={active_collection_id}
+                                                active_collection_is_default={active_is_default}
                                             />
                                         </div>
                                     }

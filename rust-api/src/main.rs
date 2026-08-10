@@ -43,6 +43,10 @@ pub struct AppState {
     pub task_manager: Arc<TaskManager>,
     pub task_spawner: Arc<TaskSpawner>,
     pub websocket_manager: Arc<WebSocketManager>,
+    pub now_playing_manager: Arc<handlers::nowplaying::NowPlayingManager>,
+    /// Unique id for this API process, used by the now-playing pub/sub bridge to
+    /// ignore the messages it published itself (it already handled them locally).
+    pub instance_id: Arc<str>,
     pub import_progress_manager: Arc<ImportProgressManager>,
     pub notification_manager: Arc<NotificationManager>,
     /// Set while a full server restore is running. Used to reject concurrent restores
@@ -97,10 +101,15 @@ async fn main() -> AppResult<()> {
     let redis_client = RedisClient::new(&config).await?;
     info!("Redis/Valkey client initialized");
 
+    // Unique id for this API process — created before the task manager so it can
+    // stamp its cross-replica bridge packets and ignore its own echoes.
+    let instance_id: Arc<str> = Arc::from(uuid::Uuid::new_v4().to_string().as_str());
+
     // Initialize task management
-    let task_manager = Arc::new(TaskManager::new(redis_client.clone()));
+    let task_manager = Arc::new(TaskManager::new(redis_client.clone(), instance_id.clone()));
     let task_spawner = Arc::new(TaskSpawner::new(task_manager.clone(), db_pool.clone()));
     let websocket_manager = Arc::new(WebSocketManager::new());
+    let now_playing_manager = Arc::new(handlers::nowplaying::NowPlayingManager::new());
     let import_progress_manager = Arc::new(ImportProgressManager::new(redis_client.clone()));
     let notification_manager = Arc::new(NotificationManager::new());
     info!("Task management system initialized");
@@ -113,6 +122,8 @@ async fn main() -> AppResult<()> {
         task_manager,
         task_spawner,
         websocket_manager,
+        now_playing_manager,
+        instance_id,
         import_progress_manager,
         notification_manager,
         restore_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -121,6 +132,16 @@ async fn main() -> AppResult<()> {
 
     // Start the AI sidecar health monitor (no-op if PINEPODS_AI_URL is unset).
     crate::services::ai_client::spawn_health_monitor(app_state.ai_available.clone());
+
+    // Bridge now-playing reports/commands across API replicas via Valkey pub/sub.
+    // Degrades cleanly to in-process fan-out if the subscribe connection can't be
+    // established (the default single-container deploy needs no bridge).
+    handlers::nowplaying::spawn_nowplaying_bridge(app_state.clone());
+
+    // Bridge task-progress + notification events across API replicas via Valkey
+    // pub/sub. Same best-effort pattern: re-injects remote events into the local
+    // broadcast so sockets on this replica see tasks/messages raised elsewhere.
+    handlers::websocket::spawn_task_bridge(app_state.clone());
 
     // Build the application with routes
     let app = create_app(app_state.clone());
@@ -218,6 +239,11 @@ fn create_app(state: AppState) -> Router {
 
 fn create_data_routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
+        // Durable in-app notifications (Activity center messages)
+        .routes(routes!(handlers::notifications::list_notifications))
+        .routes(routes!(handlers::notifications::mark_notification_read))
+        .routes(routes!(handlers::notifications::dismiss_notification))
+        .routes(routes!(handlers::notifications::clear_notifications))
         .routes(routes!(handlers::auth::get_key))
         .routes(routes!(handlers::auth::verify_mfa_and_get_key))
         .routes(routes!(handlers::auth::verify_api_key_endpoint))
@@ -257,6 +283,8 @@ fn create_data_routes() -> OpenApiRouter<AppState> {
         .routes(routes!(handlers::podcasts::check_podcast))
         .routes(routes!(handlers::podcasts::check_episode_in_db))
         .routes(routes!(handlers::podcasts::queue_episode))
+        .routes(routes!(handlers::podcasts::queue_episode_to_top))
+        .routes(routes!(handlers::nowplaying::now_playing_devices))
         .routes(routes!(handlers::podcasts::remove_queued_episode))
         .routes(routes!(handlers::podcasts::get_queued_episodes))
         .routes(routes!(handlers::podcasts::reorder_queue))
@@ -446,6 +474,8 @@ fn create_data_routes() -> OpenApiRouter<AppState> {
         .routes(routes!(handlers::settings::adjust_ad_skip_auto_activate))
         .routes(routes!(handlers::settings::get_ad_skip_auto_activate))
         .routes(routes!(handlers::settings::get_ai_settings, handlers::settings::update_ai_settings))
+        .routes(routes!(handlers::settings::get_ytdlp_settings, handlers::settings::update_ytdlp_settings))
+        .routes(routes!(handlers::settings::trigger_ytdlp_update))
         .routes(routes!(handlers::settings::get_ai_models))
         .routes(routes!(handlers::settings::ai_pull_model))
         .routes(routes!(handlers::settings::remove_category))
@@ -541,6 +571,7 @@ fn create_websocket_routes() -> Router<AppState> {
     Router::new()
         .route("/api/tasks/{user_id}", get(handlers::websocket::task_progress_websocket))
         .route("/api/data/episodes/{user_id}", get(handlers::refresh::websocket_refresh_episodes))
+        .route("/api/nowplaying/{user_id}", get(handlers::nowplaying::now_playing_websocket))
 }
 
 fn create_auth_routes() -> OpenApiRouter<AppState> {

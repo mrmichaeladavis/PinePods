@@ -510,6 +510,19 @@ pub fn settings() -> Html {
                             </div>
                             <div class="settings-section">
                                 <div class="settings-section-head">
+                                    <i class="ph ph-youtube-logo"></i>
+                                    <div>
+                                        <div class="settings-section-title-row">
+                                            <div class="settings-section-title">{ &i18n.t("settings.ytdlp_management") }</div>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="settings-section-body">
+                                    <setting_components::ytdlp_settings::YtDlpSettings />
+                                </div>
+                            </div>
+                            <div class="settings-section">
+                                <div class="settings-section-head">
                                     <i class="ph ph-gear"></i>
                                     <div>
                                         <div class="settings-section-title-row">

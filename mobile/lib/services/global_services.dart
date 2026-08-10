@@ -1,4 +1,5 @@
 // lib/services/global_services.dart
+import 'package:pinepods_mobile/services/nowplaying/nowplaying_service.dart';
 import 'package:pinepods_mobile/services/offline/offline_action_queue.dart';
 import 'package:pinepods_mobile/services/pinepods/pinepods_audio_service.dart';
 import 'package:pinepods_mobile/services/pinepods/pinepods_service.dart';
@@ -8,17 +9,23 @@ class GlobalServices {
   static PinepodsAudioService? _pinepodsAudioService;
   static PinepodsService? _pinepodsService;
   static OfflineActionQueue? _offlineActionQueue;
+  static NowPlayingService? _nowPlayingService;
 
   /// Set the global services (called from PinepodsPodcastApp)
   static void initialize({
     required PinepodsAudioService pinepodsAudioService,
     required PinepodsService pinepodsService,
     OfflineActionQueue? offlineActionQueue,
+    NowPlayingService? nowPlayingService,
   }) {
     _pinepodsAudioService = pinepodsAudioService;
     _pinepodsService = pinepodsService;
     _offlineActionQueue = offlineActionQueue;
+    _nowPlayingService = nowPlayingService;
   }
+
+  /// Get the global now-playing (cross-device awareness) service instance
+  static NowPlayingService? get nowPlayingService => _nowPlayingService;
 
   /// Get the global offline action queue instance
   static OfflineActionQueue? get offlineActionQueue => _offlineActionQueue;

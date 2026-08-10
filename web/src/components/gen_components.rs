@@ -4,6 +4,7 @@ use i18nrs::yew::use_translation;
 use crate::components::gen_funcs::format_error_message;
 use crate::components::gen_funcs::format_time;
 use crate::components::notification_center::{NotificationCenter, ToastNotification};
+use crate::components::remote_devices::RemoteDevices;
 use crate::components::safehtml::SafeHtml;
 use crate::requests::search_pods::{
     call_get_podcast_info, call_youtube_search, YouTubeSearchResults,
@@ -574,6 +575,7 @@ pub fn search_bar() -> Html {
                         <button type="submit" class="iconbtn" title="Search">
                             <i class="ph ph-magnifying-glass"></i>
                         </button>
+                        <RemoteDevices />
                         <NotificationCenter />
                     </form>
                 } else if !*expanded {

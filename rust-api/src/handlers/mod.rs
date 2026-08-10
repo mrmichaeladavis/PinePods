@@ -5,6 +5,7 @@ pub mod episodes;
 pub mod playlists;
 pub mod collections;
 pub mod websocket;
+pub mod notifications;
 // pub mod async_tasks_examples;  // File was deleted
 pub mod refresh;
 pub mod proxy;
@@ -14,6 +15,7 @@ pub mod youtube;
 pub mod tasks;
 pub mod feed;
 pub mod local_podcast;
+pub mod nowplaying;
 
 // Common handler utilities
 use axum::http::HeaderMap;

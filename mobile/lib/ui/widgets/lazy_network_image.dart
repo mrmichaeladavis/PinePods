@@ -1,8 +1,16 @@
 // lib/ui/widgets/lazy_network_image.dart
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 
 class LazyNetworkImage extends StatefulWidget {
   final String imageUrl;
+
+  /// Absolute path to a locally-cached copy of the image. When set and the file
+  /// exists on disk, it is rendered instead of [imageUrl] so artwork shows with
+  /// no network (offline, #935). Falls back to [imageUrl] if the file is
+  /// missing.
+  final String? localImagePath;
   final double width;
   final double height;
   final BoxFit fit;
@@ -13,6 +21,7 @@ class LazyNetworkImage extends StatefulWidget {
   const LazyNetworkImage({
     super.key,
     required this.imageUrl,
+    this.localImagePath,
     required this.width,
     required this.height,
     this.fit = BoxFit.cover,
@@ -69,8 +78,35 @@ class _LazyNetworkImageState extends State<LazyNetworkImage> {
     });
   }
 
+  /// The locally-cached file to render, or null when there isn't one on disk.
+  File? get _localFile {
+    final path = widget.localImagePath;
+    if (path == null || path.isEmpty) return null;
+    final file = File(path);
+    return file.existsSync() ? file : null;
+  }
+
   @override
   Widget build(BuildContext context) {
+    final localFile = _localFile;
+    if (localFile != null) {
+      // A cached copy exists — render it directly (no network, no lazy gate).
+      return ClipRRect(
+        borderRadius: widget.borderRadius ?? BorderRadius.zero,
+        child: Image.file(
+          localFile,
+          width: widget.width,
+          height: widget.height,
+          fit: widget.fit,
+          cacheWidth: (widget.width * 2).round(),
+          cacheHeight: (widget.height * 2).round(),
+          errorBuilder: (context, error, stackTrace) {
+            return widget.errorWidget ?? _defaultErrorWidget;
+          },
+        ),
+      );
+    }
+
     return ClipRRect(
       borderRadius: widget.borderRadius ?? BorderRadius.zero,
       child: _shouldLoad && widget.imageUrl.isNotEmpty

@@ -4,6 +4,7 @@ use crate::components::gen_funcs::format_time;
 use crate::requests::episode::Episode;
 use crate::requests::pod_req::{
     call_get_queued_episodes, call_remove_queued_episode, call_reorder_queue, QueuePodcastRequest,
+    ReorderQueueItem,
     QueuedEpisodesResponse,
 };
 use i18nrs::yew::use_translation;
@@ -202,6 +203,13 @@ pub fn queue_manage_modal(props: &QueueManageModalProps) -> Html {
         let ordered = ordered.clone();
         Callback::from(move |_: MouseEvent| {
             let episode_ids: Vec<i32> = ordered.iter().map(|e| e.episodeid).collect();
+            let reorder_items: Vec<ReorderQueueItem> = ordered
+                .iter()
+                .map(|e| ReorderQueueItem {
+                    episode_id: e.episodeid,
+                    is_youtube: e.is_youtube,
+                })
+                .collect();
             let ordered_snapshot = ordered.clone();
             let server = server.clone();
             let api_key = api_key.clone();
@@ -210,7 +218,7 @@ pub fn queue_manage_modal(props: &QueueManageModalProps) -> Html {
             let confirm = confirm.clone();
             applying.set(true);
             spawn_local(async move {
-                match call_reorder_queue(&server, &api_key, &user_id, &episode_ids).await {
+                match call_reorder_queue(&server, &api_key, &user_id, reorder_items).await {
                     Ok(_) => {
                         Dispatch::<EpisodeStatusState>::global().reduce_mut(move |s| {
                             s.queued_episodes = Some(QueuedEpisodesResponse {
@@ -262,6 +270,8 @@ pub fn queue_manage_modal(props: &QueueManageModalProps) -> Html {
                         episode_id,
                         user_id,
                         is_youtube,
+                        playing_episode_id: None,
+                        playing_is_youtube: None,
                     };
                     let _ = call_remove_queued_episode(&server, &api_key, &req).await;
                 }

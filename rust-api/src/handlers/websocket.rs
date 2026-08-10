@@ -11,7 +11,7 @@ use std::{collections::HashMap, sync::Arc};
 use tokio::sync::{broadcast, RwLock};
 use crate::{
     handlers::{check_user_access, extract_api_key, validate_api_key},
-    services::task_manager::{TaskUpdate, WebSocketMessage},
+    services::task_manager::{BridgeEvent, BridgePacket, TaskUpdate, WebSocketMessage, TASK_EVENTS_CHANNEL},
     AppState,
 };
 
@@ -109,8 +109,9 @@ async fn handle_task_progress_socket(socket: WebSocket, user_id: i32, state: App
     // Add connection to manager
     state.websocket_manager.add_connection(user_id, tx.clone()).await;
 
-    // Subscribe to task manager updates
+    // Subscribe to task-progress + durable-notification streams.
     let mut task_receiver = state.task_manager.subscribe_to_progress();
+    let mut notif_receiver = state.task_manager.subscribe_to_notifications();
 
     // Spawn task to forward task manager updates to user
     let tx_clone = tx.clone();
@@ -122,29 +123,34 @@ async fn handle_task_progress_socket(socket: WebSocket, user_id: i32, state: App
         }
     });
 
-    // Send initial task list to newly connected client
+    // Send initial task list + durable notifications to the newly connected client.
     let initial_tasks = state.task_manager.get_user_tasks(user_id).await.unwrap_or_default();
-    let initial_message = WebSocketMessage {
-        event: "initial".to_string(),
-        task: None,
-        tasks: Some(initial_tasks),
-    };
+    let initial_notifs = state.task_manager.list_notifications(user_id).await.unwrap_or_default();
+    let initial_message = WebSocketMessage::tasks("initial", initial_tasks, initial_notifs);
     let initial_json = match serde_json::to_string(&initial_message) {
         Ok(json) => json,
         Err(_) => "{}".to_string(),
     };
     let _ = sender.send(Message::Text(initial_json.into())).await;
 
-    // Spawn task to send WebSocket messages
+    // Spawn task to send WebSocket messages: task updates (per-connection channel)
+    // and durable notifications (global stream, filtered by user) share the sink.
     let websocket_task = tokio::spawn(async move {
-        while let Ok(update) = rx.recv().await {
-            // Wrap the update in the WebSocket event format
-            let ws_message = WebSocketMessage {
-                event: "update".to_string(),
-                task: Some(update),
-                tasks: None,
+        loop {
+            let ws_message = tokio::select! {
+                r = rx.recv() => match r {
+                    Ok(update) => WebSocketMessage::update(update),
+                    Err(broadcast::error::RecvError::Closed) => break,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                },
+                n = notif_receiver.recv() => match n {
+                    Ok(notif) if notif.user_id == user_id => WebSocketMessage::notification(notif),
+                    Ok(_) => continue,
+                    Err(broadcast::error::RecvError::Closed) => continue,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                },
             };
-            
+
             let message = match serde_json::to_string(&ws_message) {
                 Ok(json) => Message::Text(json.into()),
                 Err(_) => continue,
@@ -182,6 +188,56 @@ async fn handle_task_progress_socket(socket: WebSocket, user_id: i32, state: App
 
     // Clean up connection
     state.websocket_manager.remove_connection(user_id, &tx).await;
+}
+
+// ======================= Multi-replica pub/sub bridge =======================
+//
+// Task progress + durable notifications are held in shared Valkey, but the live
+// broadcast that feeds each socket is in-process. With more than one API replica,
+// an event raised on replica A must reach the sockets on replica B. Every emit
+// publishes a `BridgePacket` (stamped with the origin instance id) to
+// `TASK_EVENTS_CHANNEL`; here we subscribe and re-inject packets from *other*
+// instances into the local broadcast. Degrades cleanly to in-process fan-out
+// when pub/sub is unavailable (the default single-container deploy needs none).
+
+/// Start the Valkey subscriber that relays task/notification events from other
+/// API replicas onto this instance's local streams. Best-effort: logs and retries.
+pub fn spawn_task_bridge(state: AppState) {
+    tokio::spawn(async move {
+        loop {
+            if let Err(e) = run_task_bridge(&state).await {
+                tracing::warn!("task pub/sub bridge stopped ({e}); retrying in 5s");
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
+    });
+}
+
+async fn run_task_bridge(state: &AppState) -> crate::error::AppResult<()> {
+    let mut pubsub = state.redis_client.get_pubsub().await?;
+    pubsub.subscribe(TASK_EVENTS_CHANNEL).await?;
+    tracing::info!("task pub/sub bridge subscribed to {TASK_EVENTS_CHANNEL}");
+
+    let mut messages = pubsub.on_message();
+    while let Some(msg) = messages.next().await {
+        let payload: String = match msg.get_payload() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let packet: BridgePacket = match serde_json::from_str(&payload) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        // Ignore what we published ourselves — already delivered locally.
+        if packet.instance_id == state.instance_id.as_ref() {
+            continue;
+        }
+        match packet.event {
+            BridgeEvent::Task(update) => state.task_manager.reinject_update(update),
+            BridgeEvent::Notification(notif) => state.task_manager.reinject_notification(notif),
+        }
+    }
+    Ok(())
 }
 
 #[utoipa::path(

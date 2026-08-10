@@ -19,6 +19,11 @@ class PinepodsEpisode {
   final String? listenDate;
   final String? saveDate;
 
+  /// Absolute path to a locally-cached copy of [episodeArtwork], if one was
+  /// downloaded alongside the audio. Lets the artwork render with no network
+  /// (offline). Null for server/streamed episodes.
+  final String? localImagePath;
+
   PinepodsEpisode({
     required this.podcastName,
     required this.episodeTitle,
@@ -37,6 +42,7 @@ class PinepodsEpisode {
     this.podcastId,
     this.listenDate,
     this.saveDate,
+    this.localImagePath,
   });
 
   factory PinepodsEpisode.fromJson(Map<String, dynamic> json) {

@@ -1,4 +1,5 @@
 use crate::components::context::{AppState, CollectionModalState, ContextMenuState, EpisodeStatusState, NotificationState};
+use crate::components::context::current_playing_anchor;
 #[cfg(not(feature = "server_build"))]
 use crate::components::context::UIState;
 #[cfg(not(feature = "server_build"))]
@@ -86,6 +87,19 @@ pub struct ContextButtonProps {
     pub position: Option<(i32, i32)>,
     #[prop_or(None)]
     pub on_close: Option<Callback<()>>,
+    /// Emitted (with the episode id) when the episode is removed from the list currently being
+    /// shown, so the parent page can drop it from its local `Vec` without a refetch. Pages that
+    /// render from a local `use_state` list (Saved/collections, Downloads) wire this; others
+    /// leave it at the no-op default.
+    #[prop_or_default]
+    pub on_episode_removed: Callback<i32>,
+    /// The collection currently being viewed (None if the page isn't a collection view). Used to
+    /// scope collection-removal signals to the active tab.
+    #[prop_or(None)]
+    pub active_collection_id: Option<i32>,
+    /// Whether the active collection tab is the pinned default Saved bucket.
+    #[prop_or(false)]
+    pub active_collection_is_default: bool,
 }
 
 #[function_component(ContextMenuButton)]
@@ -357,10 +371,14 @@ pub fn context_button(props: &ContextButtonProps) -> Html {
             let server_name_copy = queue_server_name.clone();
             let api_key_copy = queue_api_key.clone();
             let episode_clone = episode.clone();
+            // Anchor the insert under whatever is playing on this device ("play next").
+            let (playing_episode_id, playing_is_youtube) = current_playing_anchor();
             let request = QueuePodcastRequest {
                 episode_id: episode.episodeid,
                 user_id: user_id.unwrap(), // replace with the actual user ID
                 is_youtube: episode.is_youtube,
+                playing_episode_id,
+                playing_is_youtube,
             };
             let server_name = server_name_copy; // replace with the actual server name
             let api_key = api_key_copy; // replace with the actual API key
@@ -403,6 +421,8 @@ pub fn context_button(props: &ContextButtonProps) -> Html {
                 episode_id: episode.episodeid,
                 user_id: user_id.unwrap(), // replace with the actual user ID
                 is_youtube: episode.is_youtube,
+                playing_episode_id: None,
+                playing_is_youtube: None,
             };
             let server_name = server_name_copy; // replace with the actual server name
             let api_key = api_key_copy; // replace with the actual API key
@@ -506,9 +526,12 @@ pub fn context_button(props: &ContextButtonProps) -> Html {
     let on_remove_saved_episode = {
         let episode = props.episode.clone();
         let _episode_id = props.episode.episodeid;
+        let on_episode_removed = props.on_episode_removed.clone();
+        let active_collection_is_default = props.active_collection_is_default;
         Callback::from(move |_| {
             let server_name_copy = remove_saved_server_name.clone();
             let api_key_copy = remove_saved_api_key.clone();
+            let on_episode_removed = on_episode_removed.clone();
             let request = SavePodcastRequest {
                 episode_id: episode.episodeid,
                 user_id: user_id.unwrap(),
@@ -528,6 +551,12 @@ pub fn context_button(props: &ContextButtonProps) -> Html {
                                 .saved_episodes
                                 .retain(|e| e.episodeid != episode.episodeid);
                         });
+                        // Drop the card from the page's local list only on the default Saved tab.
+                        // On a custom collection tab this action removes from the Saved bucket, but
+                        // the episode may still belong to the viewed collection.
+                        if active_collection_is_default {
+                            on_episode_removed.emit(episode.episodeid);
+                        }
                         Dispatch::<NotificationState>::global().reduce_mut(|state| {
                             state.info_message = Some(format!("{}", formatted_info).to_string());
                         });
@@ -604,9 +633,11 @@ pub fn context_button(props: &ContextButtonProps) -> Html {
     let on_remove_downloaded_episode = {
         let episode = props.episode.clone();
         let _episode_id = props.episode.episodeid;
+        let on_episode_removed = props.on_episode_removed.clone();
         Callback::from(move |_| {
             let server_name_copy = remove_download_server_name.clone();
             let api_key_copy = remove_download_api_key.clone();
+            let on_episode_removed = on_episode_removed.clone();
             let request = DownloadEpisodeRequest {
                 episode_id: episode.episodeid,
                 user_id: user_id.unwrap(), // replace with the actual user ID
@@ -630,6 +661,7 @@ pub fn context_button(props: &ContextButtonProps) -> Html {
                         Dispatch::<EpisodeStatusState>::global().reduce_mut(|state| {
                             state.downloaded_episodes.remove_local(episode.episodeid);
                         });
+                        on_episode_removed.emit(episode.episodeid);
                         Dispatch::<NotificationState>::global().reduce_mut(|state| {
                             state.info_message = Some(format!("{}", formatted_info).to_string());
                         });
@@ -1105,6 +1137,8 @@ pub fn context_button(props: &ContextButtonProps) -> Html {
         let ep_id = props.episode.episodeid;
         let is_yt = props.episode.is_youtube;
         let episode = props.episode.clone();
+        let on_episode_removed = props.on_episode_removed.clone();
+        let active_collection_id = props.active_collection_id;
         move |col_id: i32, is_member: bool| -> Callback<MouseEvent> {
             let submenu_members = submenu_members.clone();
             let is_default = submenu_collections.iter()
@@ -1114,6 +1148,7 @@ pub fn context_button(props: &ContextButtonProps) -> Html {
             let server = server.clone();
             let api_key = api_key.clone();
             let episode = episode.clone();
+            let on_episode_removed = on_episode_removed.clone();
             Callback::from(move |e: MouseEvent| {
                 e.stop_propagation();
                 let mut set = (*submenu_members).clone();
@@ -1129,11 +1164,16 @@ pub fn context_button(props: &ContextButtonProps) -> Html {
                 let server = server.clone();
                 let api_key = api_key.clone();
                 let episode = episode.clone();
+                let on_episode_removed = on_episode_removed.clone();
                 spawn_local(async move {
                     if now_member {
                         let _ = call_add_episode_to_collection(&server, &api_key, col_id, &req).await;
                     } else {
                         let _ = call_remove_episode_from_collection(&server, &api_key, col_id, &req).await;
+                        // Removing from the collection the page is currently showing: drop the card.
+                        if Some(col_id) == active_collection_id {
+                            on_episode_removed.emit(ep_id);
+                        }
                     }
                     if is_default {
                         if now_member {

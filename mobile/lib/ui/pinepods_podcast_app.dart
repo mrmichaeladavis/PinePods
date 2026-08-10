@@ -30,6 +30,8 @@ import 'package:pinepods_mobile/services/download/mobile_download_manager.dart';
 import 'package:pinepods_mobile/services/download/mobile_download_service.dart';
 import 'package:pinepods_mobile/services/podcast/mobile_podcast_service.dart';
 import 'package:pinepods_mobile/services/podcast/podcast_service.dart';
+import 'package:pinepods_mobile/services/network/connectivity_service.dart';
+import 'package:pinepods_mobile/services/nowplaying/nowplaying_service.dart';
 import 'package:pinepods_mobile/services/offline/offline_action_queue.dart';
 import 'package:pinepods_mobile/services/pinepods/pinepods_service.dart';
 import 'package:pinepods_mobile/services/pinepods/pinepods_audio_service.dart';
@@ -94,6 +96,7 @@ class PinepodsPodcastApp extends StatefulWidget {
   late PinepodsAudioService pinepodsAudioService;
   late PinepodsService pinepodsService;
   late OfflineActionQueue offlineActionQueue;
+  late NowPlayingService nowPlayingService;
   CarPlayService? carPlayService;
 
   PinepodsPodcastApp({
@@ -151,11 +154,22 @@ class PinepodsPodcastApp extends StatefulWidget {
     pinepodsAudioService.setActionQueue(offlineActionQueue);
     offlineActionQueue.start();
 
+    // Cross-device now-playing awareness + remote control (best-effort socket).
+    // The audio service reports over it on its playback tick; inbound remote
+    // commands are applied to the local, authoritative player.
+    nowPlayingService = NowPlayingService(
+      audioPlayerService: audioPlayerService,
+      pinepodsService: pinepodsService,
+      pinepodsAudioService: pinepodsAudioService,
+    );
+    pinepodsAudioService.setNowPlayingService(nowPlayingService);
+
     // Initialize global services for app-wide access
     GlobalServices.initialize(
       pinepodsAudioService: pinepodsAudioService,
       pinepodsService: pinepodsService,
       offlineActionQueue: offlineActionQueue,
+      nowPlayingService: nowPlayingService,
     );
 
     // Initialize CarPlay service for iOS
@@ -192,10 +206,40 @@ class PinepodsPodcastAppState extends State<PinepodsPodcastApp> {
           theme = newTheme;
         }
       });
+
+      // Keep the now-playing socket in step with auth state. connect() is
+      // idempotent (a no-op when already connected to the same session), so
+      // this safely covers both app-start-already-logged-in and fresh login;
+      // it drops the socket on logout. Best-effort — never blocks the UI.
+      _syncNowPlayingConnection(event);
     });
 
     // Initialize theme from current settings
     theme = ThemeRegistry.getThemeData(widget.mobileSettingsService.theme);
+
+    // Cover the already-authenticated cold-start case (the settings stream may
+    // not re-emit before the user starts playing).
+    _syncNowPlayingConnection(widget.settingsBloc!.currentSettings);
+  }
+
+  /// Open or close the now-playing socket to match the current auth state.
+  void _syncNowPlayingConnection(AppSettings settings) {
+    final server = settings.pinepodsServer;
+    final apiKey = settings.pinepodsApiKey;
+    final userId = settings.pinepodsUserId;
+    if (server != null &&
+        server.isNotEmpty &&
+        apiKey != null &&
+        apiKey.isNotEmpty &&
+        userId != null) {
+      widget.nowPlayingService.connect(
+        server: server,
+        apiKey: apiKey,
+        userId: userId,
+      );
+    } else {
+      widget.nowPlayingService.disconnect();
+    }
   }
 
   @override
@@ -244,6 +288,11 @@ class PinepodsPodcastAppState extends State<PinepodsPodcastApp> {
         ),
         Provider<AudioPlayerService>(create: (_) => widget.audioPlayerService),
         Provider<PodcastService>(create: (_) => widget.podcastService!),
+        // App-wide offline/reachability state (#935). Singleton so the audio
+        // service and other non-widget code can consult it too.
+        ChangeNotifierProvider<ConnectivityService>.value(
+          value: ConnectivityService.instance,
+        ),
       ],
       child: MaterialApp(
         debugShowCheckedModeBanner: false,
@@ -302,6 +351,37 @@ class _PinepodsHomePageState extends State<PinepodsHomePage>
 
     /// Handle deep links
     _setupLinkListener();
+
+    /// Start proactive offline detection and, if the server is unreachable at
+    /// launch, land on the Downloads tab so on-device episodes are immediately
+    /// browsable/playable instead of stranding the user on the (server-backed)
+    /// Home tab (#935).
+    _initConnectivityAndOfflineLanding();
+  }
+
+  void _initConnectivityAndOfflineLanding() {
+    final settingsBloc = Provider.of<SettingsBloc>(context, listen: false);
+    ConnectivityService.instance
+        .init(() => settingsBloc.currentSettings.pinepodsServer)
+        .then((_) {
+      if (!mounted) return;
+      if (ConnectivityService.instance.isOffline) {
+        _openDownloadsTab();
+      }
+    });
+  }
+
+  /// Switch the bottom-nav selection to the Downloads tab, if the user has it
+  /// enabled. No-op when Downloads has been removed from [bottomBarOrder].
+  void _openDownloadsTab() {
+    final pager = Provider.of<PagerBloc>(context, listen: false);
+    final order = Provider.of<SettingsBloc>(context, listen: false)
+        .currentSettings
+        .bottomBarOrder;
+    final idx = order.indexOf('Downloads');
+    if (idx >= 0) {
+      pager.changePage(idx);
+    }
   }
 
   /// We listen to external links from outside the app. For example, someone may navigate

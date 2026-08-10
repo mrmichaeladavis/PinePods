@@ -107,7 +107,7 @@ jobs:
 
       - name: Install Tauri
         run: |
-          cargo install tauri-cli@2.0.0-rc.15 --locked
+          cargo install tauri-cli@2.11.4 --locked
 
       - name: Update Tauri version (UNIX)
         run: |

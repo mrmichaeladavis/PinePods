@@ -5602,3 +5602,63 @@ def migration_058_create_recommendation_cache(conn, db_type: str) -> None:
         raise
     finally:
         cursor.close()
+
+
+@register_migration("059", "add_ytdlp_management_columns", "Add self-updating yt-dlp management columns to AppSettings (#793)", requires=["001"])
+def add_ytdlp_management_columns(conn, db_type: str) -> None:
+    """Admin controls for the locally-run, self-updating yt-dlp binary (#793).
+
+    YouTube support breaks whenever Google changes YouTube internals; the fix is a newer
+    yt-dlp. Rather than rebuild/release the image for every yt-dlp bump, the binary now
+    updates itself on a schedule (and on demand) via `yt-dlp --update-to <channel>`.
+
+      YtDlpAutoUpdate  - run the daily + startup auto-update (default ON, so most installs
+                         self-heal without intervention)
+      YtDlpChannel     - update channel: 'stable' or 'nightly'. Nightly is the escape hatch:
+                         YouTube fixes usually land in nightly the same day, before a stable
+                         release.
+      YtDlpLastUpdated - timestamp of the last update attempt (for the settings UI)
+      YtDlpLastResult  - human-readable result of the last update attempt (version or error)
+
+    Defaults keep existing installs auto-updating on the stable channel."""
+    logger.info("Starting migration 059: add yt-dlp management columns to AppSettings")
+    cursor = conn.cursor()
+
+    # (column_name, postgres_type_default, mysql_type_default)
+    columns = [
+        ("YtDlpAutoUpdate", "BOOLEAN DEFAULT TRUE", "TINYINT(1) DEFAULT 1"),
+        ("YtDlpChannel", "VARCHAR(20) DEFAULT 'stable'", "VARCHAR(20) DEFAULT 'stable'"),
+        ("YtDlpLastUpdated", "TIMESTAMP NULL", "TIMESTAMP NULL"),
+        ("YtDlpLastResult", "TEXT", "TEXT"),
+    ]
+
+    try:
+        for name, pg_def, my_def in columns:
+            try:
+                if db_type == "postgresql":
+                    cursor.execute(
+                        f'ALTER TABLE "AppSettings" ADD COLUMN IF NOT EXISTS {name} {pg_def}'
+                    )
+                else:  # MySQL/MariaDB
+                    cursor.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM INFORMATION_SCHEMA.COLUMNS
+                        WHERE TABLE_SCHEMA = DATABASE()
+                        AND TABLE_NAME = 'AppSettings'
+                        AND COLUMN_NAME = %s
+                        """,
+                        (name,),
+                    )
+                    if cursor.fetchone()[0] == 0:
+                        cursor.execute(f"ALTER TABLE AppSettings ADD COLUMN {name} {my_def}")
+                        logger.info(f"Added {name} column to AppSettings table")
+                    else:
+                        logger.info(f"{name} column already exists in AppSettings table")
+            except Exception as e:
+                logger.error(f"Error adding {name} to AppSettings table: {e}")
+
+        logger.info("yt-dlp management columns migration completed")
+
+    finally:
+        cursor.close()

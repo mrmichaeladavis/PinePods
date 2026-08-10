@@ -4,6 +4,7 @@ use crate::components::gen_components::FallbackImage;
 use crate::components::queue_manage_modal::QueueManageModal;
 use crate::requests::pod_req::{
     call_clear_queue, call_get_queued_episodes, call_remove_queued_episode, call_reorder_queue,
+    ReorderQueueItem,
     QueuePodcastRequest, QueuedEpisodesResponse,
 };
 use i18nrs::yew::use_translation;
@@ -201,8 +202,13 @@ pub fn queue_panel() -> Html {
                             let item = episodes.remove(from);
                             episodes.insert(to, item);
 
-                            let episode_ids: Vec<i32> =
-                                episodes.iter().map(|ep| ep.episodeid).collect();
+                            let reorder_items: Vec<ReorderQueueItem> = episodes
+                                .iter()
+                                .map(|ep| ReorderQueueItem {
+                                    episode_id: ep.episodeid,
+                                    is_youtube: ep.is_youtube,
+                                })
+                                .collect();
 
                             ep_dispatch.reduce_mut(|s| {
                                 s.queued_episodes =
@@ -221,7 +227,7 @@ pub fn queue_panel() -> Html {
                                         &server,
                                         &key,
                                         &uid,
-                                        &episode_ids,
+                                        reorder_items,
                                     )
                                     .await
                                     {
@@ -405,6 +411,8 @@ pub fn queue_panel() -> Html {
                                                 episode_id: ep_id,
                                                 user_id: uid,
                                                 is_youtube: is_yt,
+                                                playing_episode_id: None,
+                                                playing_is_youtube: None,
                                             };
                                             let _ = call_remove_queued_episode(
                                                 &server, &key, &req,

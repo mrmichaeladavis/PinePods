@@ -14,8 +14,10 @@ import 'package:pinepods_mobile/services/download/download_manager.dart';
 import 'package:pinepods_mobile/services/download/download_service.dart';
 import 'package:pinepods_mobile/services/podcast/podcast_service.dart';
 import 'package:collection/collection.dart' show IterableExtension;
+import 'package:http/http.dart' as http;
 import 'package:logging/logging.dart';
 import 'package:mp3_info/mp3_info.dart';
+import 'package:path/path.dart' show join, basenameWithoutExtension;
 import 'package:rxdart/rxdart.dart';
 
 /// An implementation of a [DownloadService] that handles downloading
@@ -192,10 +194,60 @@ class MobileDownloadService extends DownloadService {
               episode.duration = mp3Info.duration.inSeconds;
             }
           }
+
+          // Cache the episode artwork alongside the audio so covers render when
+          // the server is unreachable (#935). Best-effort; sets localImagePath.
+          await _cacheArtwork(episode);
         }
 
         await repository.saveEpisode(episode);
       }
     }
+  }
+
+  /// Best-effort download of the episode artwork so covers render offline (#935).
+  /// The image is stored next to the audio file and [Episode.localImagePath] is
+  /// set to its absolute path. Failures are swallowed — artwork is cosmetic and
+  /// the UI falls back to the remote URL / a placeholder.
+  Future<void> _cacheArtwork(Episode episode) async {
+    try {
+      final existing = episode.localImagePath;
+      if (existing != null && existing.isNotEmpty && File(existing).existsSync()) {
+        return; // already cached
+      }
+
+      final imageUrl = episode.imageUrl;
+      if (imageUrl == null || imageUrl.isEmpty) return;
+      if (episode.podcast == null || episode.filename == null) return;
+
+      final dir = await resolveDirectory(episode: episode, full: true);
+      await createDownloadDirectory(episode);
+
+      // Name the cover after the audio file so it sits alongside it.
+      final base = basenameWithoutExtension(episode.filename!);
+      final artworkPath = join(dir, '$base${_imageExtension(imageUrl)}');
+
+      final response = await http
+          .get(Uri.parse(imageUrl))
+          .timeout(const Duration(seconds: 20));
+      if (response.statusCode == 200 && response.bodyBytes.isNotEmpty) {
+        await File(artworkPath).writeAsBytes(response.bodyBytes);
+        episode.localImagePath = artworkPath;
+        log.fine('Cached episode artwork to $artworkPath');
+      }
+    } catch (e) {
+      log.fine('Could not cache episode artwork (continuing): $e');
+    }
+  }
+
+  /// Pick a file extension for a cached cover based on the source URL, defaulting
+  /// to `.jpg` when it can't be inferred.
+  String _imageExtension(String url) {
+    final path = (Uri.tryParse(url)?.path ?? '').toLowerCase();
+    if (path.endsWith('.png')) return '.png';
+    if (path.endsWith('.webp')) return '.webp';
+    if (path.endsWith('.jpeg')) return '.jpeg';
+    if (path.endsWith('.gif')) return '.gif';
+    return '.jpg';
   }
 }

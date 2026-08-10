@@ -54,6 +54,7 @@ class LocalDownloadUtils {
       downloaded: true,
       isYoutube: episode.pguid?.contains('youtube') ?? false,
       podcastId: null,
+      localImagePath: episode.localImagePath,
     );
   }
 

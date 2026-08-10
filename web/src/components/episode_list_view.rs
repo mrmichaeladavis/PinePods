@@ -101,6 +101,17 @@ pub struct EpisodeListViewProps {
     /// `NodeRef` via [`ScrollSource::Container`].
     #[prop_or(ScrollSource::Window)]
     pub scroll_source: ScrollSource,
+    /// Emitted (with the episode id) when a card is removed from the currently-shown list via its
+    /// context menu, so the parent can drop it from its source `Rc<Vec<Episode>>` without a
+    /// refetch. Must be a stable `use_callback` (see the "Stable callbacks" note above).
+    #[prop_or_default]
+    pub on_episode_removed: Callback<i32>,
+    /// The collection currently being viewed (Saved page); scopes collection-removal signals.
+    #[prop_or(None)]
+    pub active_collection_id: Option<i32>,
+    /// Whether the active collection tab is the pinned default Saved bucket.
+    #[prop_or(false)]
+    pub active_collection_is_default: bool,
 }
 
 // Mirror of the latest props that the IntersectionObserver callback needs to read on every
@@ -209,6 +220,9 @@ pub fn episode_list_view(props: &EpisodeListViewProps) -> Html {
         let on_select_above = props.on_select_above.clone();
         let on_select_below = props.on_select_below.clone();
         let selected_episodes = props.selected_episodes.clone();
+        let on_episode_removed = props.on_episode_removed.clone();
+        let active_collection_id = props.active_collection_id;
+        let active_collection_is_default = props.active_collection_is_default;
         use_callback(
             (
                 props.page_type.clone(),
@@ -217,6 +231,9 @@ pub fn episode_list_view(props: &EpisodeListViewProps) -> Html {
                 props.on_select_above.clone(),
                 props.on_select_below.clone(),
                 props.selected_episodes.clone(),
+                props.on_episode_removed.clone(),
+                props.active_collection_id,
+                props.active_collection_is_default,
             ),
             move |(ep, _i): (Episode, usize), _| {
                 let ep_id = ep.episodeid;
@@ -234,6 +251,9 @@ pub fn episode_list_view(props: &EpisodeListViewProps) -> Html {
                         is_selected={Some(is_selected)}
                         on_select_above={on_select_above.clone()}
                         on_select_below={on_select_below.clone()}
+                        on_episode_removed={on_episode_removed.clone()}
+                        active_collection_id={active_collection_id}
+                        active_collection_is_default={active_collection_is_default}
                     />
                 }
             },

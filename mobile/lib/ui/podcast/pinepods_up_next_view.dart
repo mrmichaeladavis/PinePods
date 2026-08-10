@@ -124,8 +124,11 @@ class _PinepodsUpNextViewState extends State<PinepodsUpNextView> {
       _queuedEpisodes.insert(newIndex, episode);
     });
 
-    // Get episode IDs in new order
-    final episodeIds = _queuedEpisodes.map((e) => e.episodeId).toList();
+    // Get episodes in new order, keeping is_youtube so colliding podcast/YouTube
+    // ids are repositioned correctly.
+    final reorderItems = _queuedEpisodes
+        .map((e) => (episodeId: e.episodeId, isYoutube: e.isYoutube))
+        .toList();
 
     // Call API to update order on server
     try {
@@ -141,7 +144,7 @@ class _PinepodsUpNextViewState extends State<PinepodsUpNextView> {
         return;
       }
 
-      final success = await _pinepodsService.reorderQueue(userId, episodeIds);
+      final success = await _pinepodsService.reorderQueue(userId, reorderItems);
 
       if (!success) {
         ScaffoldMessenger.of(context).showSnackBar(

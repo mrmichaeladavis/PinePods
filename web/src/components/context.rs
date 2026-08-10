@@ -160,13 +160,50 @@ pub struct PlaylistDataState {
     pub playlists: Option<Vec<Playlist>>,
 }
 
+/// A durable, no-progress notification ("message"/"alert") shown in the Activity
+/// center's Messages / "Needs attention" sections. Mirrors the backend
+/// `InAppNotification` (rust-api `services/task_manager.rs`). Distinct from a
+/// `TaskProgress` (which has progress + a lifecycle) and from a transient toast.
+#[derive(Deserialize, Clone, PartialEq, Debug)]
+pub struct NotificationMessage {
+    pub id: String,
+    pub user_id: i32,
+    pub category: String,
+    /// "info" | "success" | "warning" | "error". `warning`/`error` count toward
+    /// the bell badge.
+    pub severity: String,
+    pub title: String,
+    #[serde(default)]
+    pub body: Option<String>,
+    #[serde(default)]
+    pub episode_id: Option<i32>,
+    #[serde(default)]
+    pub podcast_id: Option<i32>,
+    #[serde(default)]
+    pub art_url: Option<String>,
+    #[serde(default)]
+    pub link: Option<String>,
+    pub created_at: String,
+    #[serde(default)]
+    pub read: bool,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+}
+
 /// Notification-only state, kept separate from AppState so that episode list pages
 /// do not re-render when a toast fires.
+///
+/// Three tiers (see the notification redesign):
+/// - `active_tasks` — ongoing, progress-bearing background operations.
+/// - `messages` — durable server-side alerts (survive reload, cleared explicitly).
+/// - `info_message`/`error_message` — transient toast feedback for client-initiated
+///   actions (flash and gone; never persisted, never in the drawer).
 #[derive(Default, Clone, PartialEq, Store, Debug)]
 pub struct NotificationState {
     pub info_message: Option<String>,
     pub error_message: Option<String>,
     pub active_tasks: Option<Vec<TaskProgress>>,
+    pub messages: Vec<NotificationMessage>,
     pub refresh_progress: Option<RefreshProgress>,
 }
 
@@ -177,6 +214,11 @@ pub struct NotificationState {
 pub struct CollectionModalState {
     pub open: bool,
     pub episode: Option<Episode>,
+    /// Broadcast when an episode is removed from a collection via this global picker modal, so a
+    /// collection page currently showing that collection can drop the card live without a refetch.
+    /// `(episode_id, collection_id, nonce)`; the nonce distinguishes repeated removals so a
+    /// subscriber processes each exactly once.
+    pub last_removed: Option<(i32, i32, u32)>,
 }
 
 /// Coordinates which episode "more options" context menu is currently open so
@@ -410,6 +452,19 @@ impl MediaElement {
     }
 }
 
+/// The episode currently loaded on this device, as a queue anchor for "add to
+/// queue → play next". A loaded episode counts whether it's playing OR paused —
+/// it's still the current episode (it sits at queue position 1), so adds should
+/// land under it. Returns `(None, None)` only when no episode is loaded, so the
+/// server inserts at the top of the queue instead.
+pub fn current_playing_anchor() -> (Option<i32>, Option<bool>) {
+    let state = yewdux::prelude::Dispatch::<UIState>::global().get();
+    if let Some(cp) = state.currently_playing.as_ref() {
+        return (Some(cp.episode_id), Some(cp.is_youtube));
+    }
+    (None, None)
+}
+
 #[derive(Default, Clone, PartialEq, Store, Debug)]
 pub struct UIState {
     pub audio_playing: Option<bool>,
@@ -483,6 +538,17 @@ impl UIState {
                 let _ = audio.play();
                 self.audio_playing = Some(true);
             }
+        }
+    }
+
+    /// Volume (0-100) to apply to a freshly-created element. Until the per-user default
+    /// has been seeded (`default_volume == None`), fall back to full volume instead of the
+    /// derive(Default) 0.0 so first playback is never silent (#828/#775).
+    pub fn effective_volume(&self) -> f64 {
+        if self.default_volume.is_none() {
+            100.0
+        } else {
+            self.audio_volume
         }
     }
 
