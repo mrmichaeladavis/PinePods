@@ -426,10 +426,13 @@ pub fn queue_panel() -> Html {
                                                 eps.sort_by_key(|e| {
                                                     e.queueposition.unwrap_or(i32::MAX)
                                                 });
+                                                let ids: Vec<i32> =
+                                                    eps.iter().map(|e| e.episodeid).collect();
                                                 dispatch.reduce_mut(|s| {
                                                     s.queued_episodes = Some(
                                                         QueuedEpisodesResponse { episodes: eps },
                                                     );
+                                                    s.queued_episode_ids = Some(ids);
                                                 });
                                             }
                                         });

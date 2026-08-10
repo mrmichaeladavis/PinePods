@@ -2410,6 +2410,7 @@ pub async fn call_bulk_queue_episodes(
         .await?;
 
     if response.ok() {
+        cache::invalidate_prefix(&format!("{}/api/data/get_queued_episodes", server_name));
         let response_body: BulkEpisodeActionResponse =
             response.json().await.map_err(|e| anyhow::Error::new(e))?;
         Ok(response_body.message)
