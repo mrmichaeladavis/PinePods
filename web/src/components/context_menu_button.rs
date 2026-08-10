@@ -11,11 +11,12 @@ use crate::requests::episode::Episode;
 use crate::components::gen_funcs::format_error_message;
 use crate::requests::pod_req::{
     call_add_episode_to_collection, call_download_episode, call_get_collection_add_ui,
-    call_get_collections, call_get_episode_collections, call_mark_episode_completed,
-    call_mark_episode_uncompleted, call_queue_episode, call_remove_downloaded_episode,
-    call_remove_episode_from_collection, call_remove_queued_episode, call_remove_saved_episode,
-    call_save_episode, Collection, CollectionEpisodeRequest, DownloadEpisodeRequest,
-    MarkEpisodeCompletedRequest, QueuePodcastRequest, SavePodcastRequest,
+    call_get_collections, call_get_episode_collections, call_get_queued_episodes,
+    call_mark_episode_completed, call_mark_episode_uncompleted, call_queue_episode,
+    call_remove_downloaded_episode, call_remove_episode_from_collection,
+    call_remove_queued_episode, call_remove_saved_episode, call_save_episode, Collection,
+    CollectionEpisodeRequest, DownloadEpisodeRequest, MarkEpisodeCompletedRequest,
+    QueuePodcastRequest, QueuedEpisodesResponse, SavePodcastRequest,
 };
 use std::collections::HashSet;
 #[cfg(not(feature = "server_build"))]
@@ -383,14 +384,27 @@ pub fn context_button(props: &ContextButtonProps) -> Html {
             let server_name = server_name_copy; // replace with the actual server name
             let api_key = api_key_copy; // replace with the actual API key
             let future = async move {
-                match call_queue_episode(&server_name.unwrap(), &api_key.flatten(), &request).await
-                {
+                let server = server_name.unwrap();
+                let key = api_key.flatten();
+                let uid = request.user_id;
+                match call_queue_episode(&server, &key, &request).await {
                     Ok(success_message) => {
                         Dispatch::<EpisodeStatusState>::global().reduce_mut(|state| {
                             if let Some(ref mut queued_episodes) = state.queued_episode_ids {
                                 queued_episodes.push(episode_clone.episodeid);
                             }
                         });
+                        if let Ok(mut eps) =
+                            call_get_queued_episodes(&server, &key, &uid).await
+                        {
+                            eps.sort_by_key(|e| e.queueposition.unwrap_or(i32::MAX));
+                            let ids: Vec<i32> = eps.iter().map(|e| e.episodeid).collect();
+                            Dispatch::<EpisodeStatusState>::global().reduce_mut(move |state| {
+                                state.queued_episodes =
+                                    Some(QueuedEpisodesResponse { episodes: eps });
+                                state.queued_episode_ids = Some(ids);
+                            });
+                        }
                         Dispatch::<NotificationState>::global().reduce_mut(|state| {
                             state.info_message = Option::from(format!("{}", success_message));
                         });
