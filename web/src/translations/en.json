@@ -863,8 +863,11 @@
   },
   "notification_center": {
     "active_tasks": "Active Tasks",
+    "activity": "Activity",
     "all_tasks": "All Tasks",
+    "clear": "Clear",
     "clear_all_notifications": "Clear all notifications",
+    "clear_completed": "Clear completed",
     "dismiss_all_completed_tasks": "Dismiss all completed tasks",
     "dismiss_completed": "Dismiss Completed",
     "dismiss_error": "Dismiss error",
@@ -876,6 +879,7 @@
     "item_youtube_video": "YouTube Video",
     "no_notifications": "No notifications",
     "notifications": "Notifications",
+    "settings": "Settings",
     "show_completed": "Show completed",
     "status_completed": "Completed",
     "status_downloading": "Downloading",
@@ -1494,6 +1498,14 @@
     "confirm_remove_selected": "Remove {count} episode(s) from the queue? This cannot be undone.",
     "confirm_remove": "Yes, remove",
     "applying": "Applying…"
+  },
+  "remote_devices": {
+    "other_devices": "Other devices",
+    "no_other_devices": "No other devices",
+    "no_devices_description": "Devices playing on your account will show up here to view and control.",
+    "pause": "Pause",
+    "play": "Play",
+    "play_here": "Play here"
   },
   "user_self_service": {
     "enable_user_self_service": "Enable User Self Service",

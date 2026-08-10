@@ -298,6 +298,11 @@ pub fn notification_center() -> Html {
     let s_completed = i18n.t("notification_center.status_completed").to_string();
     let s_failed = i18n.t("notification_center.status_failed").to_string();
 
+    let l_activity = i18n.t("notification_center.activity").to_string();
+    let l_clear = i18n.t("notification_center.clear").to_string();
+    let l_clear_completed = i18n.t("notification_center.clear_completed").to_string();
+    let l_settings = i18n.t("notification_center.settings").to_string();
+
     let type_label = {
         move |t: &str| -> String {
             match t {
@@ -715,7 +720,7 @@ pub fn notification_center() -> Html {
             <div class={classes!("nc-panel", "nc-dir-2", "nc-form-drawer", (*drawer_open).then_some("is-open"))}
                  data-density="compact" onclick={stop}>
                                 <div class="nc-header">
-                                    <h3 class="nc-h-title">{"Activity"}</h3>
+                                    <h3 class="nc-h-title">{ &l_activity }</h3>
                                     <div class="nc-h-spacer"></div>
                                     <button class="nc-h-btn" title="Close" onclick={close_drawer.clone()}>
                                         <i class="ph ph-arrow-line-right"></i>
@@ -770,7 +775,7 @@ pub fn notification_center() -> Html {
                                                                             {
                                                                                 if is_done_section {
                                                                                     html! { <button class="nc-section-clear"
-                                                                                        onclick={Callback::from(move |_| clear_done.emit(()))}>{"Clear"}</button> }
+                                                                                        onclick={Callback::from(move |_| clear_done.emit(()))}>{ &l_clear }</button> }
                                                                                 } else { html! {} }
                                                                             }
                                                                         </div>
@@ -799,14 +804,14 @@ pub fn notification_center() -> Html {
                                                     if !done_tasks.is_empty() {
                                                         html! { <button class="nc-foot-btn"
                                                             onclick={Callback::from(move |_| clear_done_footer.emit(()))}>
-                                                            <i class="ph ph-check"></i>{"Clear completed"}</button> }
+                                                            <i class="ph ph-check"></i>{ &l_clear_completed }</button> }
                                                     } else {
                                                         html! { <span style="font-size:12px;opacity:.55;padding:6px 8px">{ format!("{} active", running_count) }</span> }
                                                     }
                                                 }
                                                 <div class="nc-foot-spacer"></div>
                                                 <button class="nc-foot-btn" title="Notification settings" onclick={go_settings}>
-                                                    <i class="ph ph-gear"></i>{"Settings"}
+                                                    <i class="ph ph-gear"></i>{ &l_settings }
                                                 </button>
                                             </div>
                                         }

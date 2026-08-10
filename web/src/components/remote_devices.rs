@@ -13,6 +13,7 @@ use crate::requests::now_playing::{
     send_command, NowPlayingDevice, NowPlayingState, PendingRemotePlay,
 };
 use crate::requests::pod_req::{call_get_episode_metadata, EpisodeRequest};
+use i18nrs::yew::use_translation;
 
 fn fmt_time(secs: f64) -> String {
     if !secs.is_finite() || secs < 0.0 {
@@ -35,6 +36,14 @@ pub fn remote_devices() -> Html {
     let (app_state, _) = use_store::<AppState>();
     let (ui_state, ui_dispatch) = use_store::<UIState>();
     let open = use_state(|| false);
+
+    let (i18n, _) = use_translation();
+    let i18n_pause = i18n.t("remote_devices.pause").to_string();
+    let i18n_play = i18n.t("remote_devices.play").to_string();
+    let i18n_play_here = i18n.t("remote_devices.play_here").to_string();
+    let i18n_other_devices = i18n.t("remote_devices.other_devices").to_string();
+    let i18n_no_other_devices = i18n.t("remote_devices.no_other_devices").to_string();
+    let i18n_no_devices_description = i18n.t("remote_devices.no_devices_description").to_string();
 
     // Observe "Play here" / inbound remote-play requests and start playback on THIS
     // device. This lives here (not in AudioPlayer) because AudioPlayer only mounts
@@ -123,6 +132,9 @@ pub fn remote_devices() -> Html {
 
     let render_device = {
         let np_dispatch = np_dispatch.clone();
+        let i18n_pause = i18n_pause.clone();
+        let i18n_play = i18n_play.clone();
+        let i18n_play_here = i18n_play_here.clone();
         move |device: &NowPlayingDevice| -> Html {
             let id = device.device_id.clone();
             let is_playing = device.playing;
@@ -208,14 +220,14 @@ pub fn remote_devices() -> Html {
                         <button type="button" class="iconbtn" title="Skip back 15s" onclick={on_back}>
                             <i class="ph ph-skip-back"></i>
                         </button>
-                        <button type="button" class="iconbtn" title={ if is_playing { "Pause" } else { "Play" } } onclick={on_play_pause}>
+                        <button type="button" class="iconbtn" title={ if is_playing { i18n_pause.clone() } else { i18n_play.clone() } } onclick={on_play_pause}>
                             <i class={ if is_playing { "ph ph-pause" } else { "ph ph-play" } }></i>
                         </button>
                         <button type="button" class="iconbtn" title="Skip forward 30s" onclick={on_fwd}>
                             <i class="ph ph-skip-forward"></i>
                         </button>
                         <button type="button" class="rd-play-here ml-auto" title="Play this here" onclick={on_play_here}>
-                            <i class="ph ph-monitor-play mr-1"></i>{ "Play here" }
+                            <i class="ph ph-monitor-play mr-1"></i>{ &i18n_play_here }
                         </button>
                     </div>
                 </div>
@@ -245,7 +257,7 @@ pub fn remote_devices() -> Html {
             <div class={classes!("nc-panel", "nc-form-drawer", (*open).then_some("is-open"))}
                  data-density="compact" onclick={stop}>
                 <div class="nc-header">
-                    <h3 class="nc-h-title">{ "Other devices" }</h3>
+                    <h3 class="nc-h-title">{ &i18n_other_devices }</h3>
                     <div class="nc-h-spacer"></div>
                     <button type="button" class="nc-h-btn" title="Close" onclick={close.clone()}>
                         <i class="ph ph-arrow-line-right"></i>
@@ -255,8 +267,8 @@ pub fn remote_devices() -> Html {
                     if np_state.devices.is_empty() {
                         <div class="nc-empty">
                             <span class="nc-empty-ico"><i class="ph ph-broadcast"></i></span>
-                            <div class="nc-empty-t">{ "No other devices" }</div>
-                            <div class="nc-empty-s">{ "Devices playing on your account will show up here to view and control." }</div>
+                            <div class="nc-empty-t">{ &i18n_no_other_devices }</div>
+                            <div class="nc-empty-s">{ &i18n_no_devices_description }</div>
                         </div>
                     } else {
                         { for np_state.devices.iter().map(|d| render_device(d)) }
